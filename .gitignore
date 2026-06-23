@@ -1,0 +1,11 @@
+.venv/
+.toolchain/
+.agents/
+.codex/
+__pycache__/
+*.pyc
+output/
+output*/
+.streamlit_app.log
+.streamlit_app.err
+.streamlit/secrets.toml
