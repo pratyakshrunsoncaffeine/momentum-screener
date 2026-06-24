@@ -7,6 +7,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from screener_momentum.backtest import current_allocation, performance_summary
 from screener_momentum.config import (
     DEFAULT_MOMENTUM_WEIGHTS,
     DEFAULT_POSITIVE_RETURN_FILTERS,
@@ -106,6 +107,8 @@ def empty_results(momentum: pd.DataFrame) -> dict[str, pd.DataFrame]:
         "fundamentals": pd.DataFrame(),
         "final": momentum.head(config.final_count).copy(),
         "backtest": pd.DataFrame(),
+        "normalized_backtest": pd.DataFrame(),
+        "periods": pd.DataFrame(),
         "holdings": pd.DataFrame(),
         "performance": pd.DataFrame(),
     }
@@ -178,6 +181,8 @@ def recover_saved_results(config: ScreeningConfig) -> None:
         final = momentum.head(config.final_count).copy()
 
     backtest = read_csv_if_exists(paths["backtest"], index_col=0, parse_dates=True)
+    normalized = read_csv_if_exists(paths["normalized_backtest"], index_col=0, parse_dates=True)
+    periods = read_csv_if_exists(paths["walk_forward_periods"])
     holdings = read_csv_if_exists(paths["holdings"])
     performance = read_csv_if_exists(paths["performance"])
     st.session_state["results"] = {
@@ -185,6 +190,8 @@ def recover_saved_results(config: ScreeningConfig) -> None:
         "fundamentals": fundamentals,
         "final": final,
         "backtest": backtest,
+        "normalized_backtest": normalized,
+        "periods": periods,
         "holdings": holdings,
         "performance": performance,
     }
@@ -276,7 +283,9 @@ momentum = results["momentum"]
 fundamentals = results["fundamentals"]
 final = results["final"]
 backtest = results["backtest"]
-holdings = results["holdings"]
+normalized_backtest = results.get("normalized_backtest", pd.DataFrame())
+periods = results.get("periods", pd.DataFrame())
+holdings = results.get("holdings", pd.DataFrame())
 performance = results["performance"]
 
 metric_cols = st.columns(4)
@@ -308,19 +317,49 @@ with tabs[2]:
         st.caption(f"Partial checkpoints are written to {paths['fundamentals_partial']}")
 
 with tabs[3]:
-    st.subheader("1L Portfolio Backtest")
+    st.subheader("Walk-Forward Portfolio Backtest")
+    investment_amount = st.number_input(
+        "Investment amount",
+        min_value=500.0,
+        value=100000.0,
+        step=500.0,
+        help="Used to scale allocation and backtest values. Example: enter 7500 for a Rs. 7,500 portfolio.",
+    )
+    st.caption(
+        "Method: walk-forward price backtest with monthly rebalancing. Signals use prices available before each "
+        "rebalance date. When fundamentals are applied, this uses the current fundamentals-passed universe, which "
+        "still has current-data bias."
+    )
+    if fundamentals.empty:
+        st.warning("Fundamentals are not applied in this run. This portfolio backtest is momentum-only.")
+
+    allocation = current_allocation(final, capital=investment_amount)
+    if not allocation.empty:
+        st.markdown("Current allocation")
+        st.dataframe(allocation, use_container_width=True, hide_index=True)
+        show_download("Download current allocation", allocation, "current_allocation.csv")
+
     if backtest.empty:
-        st.info("Run the full screener with at least one final company to build the backtest.")
+        st.info("Run fundamentals or skip fundamentals with at least one final company to build the walk-forward backtest.")
     else:
-        chart_frame = backtest.reset_index(names="Date").melt("Date", var_name="Series", value_name="Value")
+        scaled_backtest = (backtest / 100000.0) * float(investment_amount)
+        normalized_view = normalized_backtest if not normalized_backtest.empty else (backtest / 100000.0) * 100.0
+        view = st.radio("Backtest view", ["Actual amount", "Rs. 100 normalized"], horizontal=True)
+        chart_source = scaled_backtest if view == "Actual amount" else normalized_view
+        chart_frame = chart_source.reset_index(names="Date").melt("Date", var_name="Series", value_name="Value")
         fig = px.line(chart_frame, x="Date", y="Value", color="Series")
-        fig.update_layout(yaxis_title="Portfolio Value", xaxis_title="")
+        fig.update_layout(yaxis_title="Portfolio Value" if view == "Actual amount" else "Value from Rs. 100", xaxis_title="")
         st.plotly_chart(fig, use_container_width=True)
 
         cols = st.columns(2)
         with cols[0]:
-            st.markdown("Portfolio allocations")
-            st.dataframe(holdings, use_container_width=True, hide_index=True)
+            st.markdown("Rebalance periods")
+            if periods.empty:
+                st.info("No period table available for this run.")
+            else:
+                st.dataframe(periods, use_container_width=True, hide_index=True)
+                show_download("Download rebalance periods", periods, "walk_forward_periods.csv")
         with cols[1]:
             st.markdown("Performance")
-            st.dataframe(performance, use_container_width=True, hide_index=True)
+            scaled_performance = performance_summary(scaled_backtest)
+            st.dataframe(scaled_performance if not scaled_performance.empty else performance, use_container_width=True, hide_index=True)

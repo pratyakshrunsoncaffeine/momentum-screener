@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .backtest import backtest_top10, performance_summary
+from .backtest import current_allocation, performance_summary, walk_forward_backtest
 from .config import ScreeningConfig
 from .fundamentals import screen_fundamentals
 from .momentum import calculate_returns, download_adjusted_close, score_momentum
@@ -24,6 +24,10 @@ def output_paths(output_dir: str | Path = "output/latest") -> dict[str, Path]:
         "fundamentals": root / "fundamentals.csv",
         "final": root / "final.csv",
         "backtest": root / "backtest.csv",
+        "normalized_backtest": root / "normalized_backtest.csv",
+        "walk_forward_backtest": root / "walk_forward_backtest.csv",
+        "walk_forward_periods": root / "walk_forward_periods.csv",
+        "current_allocation": root / "current_allocation.csv",
         "holdings": root / "holdings.csv",
         "performance": root / "performance.csv",
     }
@@ -114,12 +118,31 @@ def run_fundamentals_screen(
     final = final.sort_values("Momentum Score", ascending=False).head(config.final_count).reset_index(drop=True)
     save_frame(final, paths["final"])
 
-    curves, holdings = backtest_top10(final, months=config.backtest_months)
+    if include_fundamentals and not fundamentals.empty:
+        backtest_universe = fundamentals[fundamentals["Fundamental Pass"]].copy()
+    else:
+        backtest_universe = final.copy()
+
+    curves, normalized, periods, allocation = walk_forward_backtest(
+        backtest_universe,
+        months=config.backtest_months,
+        initial_capital=100000.0,
+        weights=config.momentum_weights,
+        positive_filters=config.positive_return_filters,
+    )
+    if allocation.empty:
+        allocation = current_allocation(final, capital=100000.0)
     performance = performance_summary(curves)
     if not curves.empty:
         save_frame(curves, paths["backtest"], include_index=True)
-    if not holdings.empty:
-        save_frame(holdings, paths["holdings"])
+        save_frame(curves, paths["walk_forward_backtest"], include_index=True)
+    if not normalized.empty:
+        save_frame(normalized, paths["normalized_backtest"], include_index=True)
+    if not periods.empty:
+        save_frame(periods, paths["walk_forward_periods"])
+    if not allocation.empty:
+        save_frame(allocation, paths["holdings"])
+        save_frame(allocation, paths["current_allocation"])
     if not performance.empty:
         save_frame(performance, paths["performance"])
     return {
@@ -127,7 +150,9 @@ def run_fundamentals_screen(
         "fundamentals": fundamentals,
         "final": final,
         "backtest": curves,
-        "holdings": holdings,
+        "normalized_backtest": normalized,
+        "periods": periods,
+        "holdings": allocation,
         "performance": performance,
     }
 

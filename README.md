@@ -7,7 +7,9 @@ This project screens NSE stocks from `ticker.csv` in four stages:
 3. Build a weighted momentum score and keep only stocks with positive 5 day, 15 day, and 1 month returns.
 4. Optionally scrape Screener.in fundamentals and apply market-cap, quarterly revenue growth, annual revenue growth, and promoter holding change filters.
 
-The dashboard also backtests a Rs. 1,00,000 portfolio invested in the top 10 final companies: 70% split across the top 5 and 30% split across the next 5, compared against Nifty 50 and a Nifty Midcap benchmark where Yahoo Finance data is available.
+The dashboard also backtests a portfolio invested in the top 10 final companies: 70% split across the top 5 and 30% split across the next 5, compared against Nifty 50 and a Nifty Midcap benchmark where Yahoo Finance data is available.
+
+The portfolio tab uses a monthly walk-forward price backtest. Each month it recalculates momentum using only price data available before that rebalance date, invests for one month, then reinvests the ending capital into the next month's selected portfolio. If fundamentals are applied, the historical backtest uses the current fundamentals-passed universe as a static filter, so it avoids price lookahead but still has current-fundamentals bias.
 
 ## Dashboard Flow
 
@@ -27,6 +29,9 @@ The main checkpoint files are:
 - `output/latest/fundamentals.csv`
 - `output/latest/final.csv`
 - `output/latest/backtest.csv`
+- `output/latest/normalized_backtest.csv`
+- `output/latest/walk_forward_periods.csv`
+- `output/latest/current_allocation.csv`
 
 ## Local Setup
 
