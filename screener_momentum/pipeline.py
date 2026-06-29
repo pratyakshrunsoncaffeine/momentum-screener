@@ -115,12 +115,18 @@ def run_fii_momentum_screen(
         progress_callback=progress_callback,
         checkpoint_path=paths["fii_partial"],
     )
-    fii_all = enrich_market_cap_from_yfinance(
-        fii_all,
-        progress_callback=price_progress_callback,
-        checkpoint_path=paths["fii_marketcap_partial"],
-    )
+    needs_market_cap = "Market Cap Cr" not in fii_all.columns or pd.to_numeric(
+        fii_all.get("Market Cap Cr", pd.Series(dtype=float)),
+        errors="coerce",
+    ).isna().all()
+    if needs_market_cap:
+        fii_all = enrich_market_cap_from_yfinance(
+            fii_all,
+            progress_callback=price_progress_callback,
+            checkpoint_path=paths["fii_marketcap_partial"],
+        )
     if "Market Cap Cr" in fii_all.columns:
+        fii_all["Market Cap Cr"] = pd.to_numeric(fii_all["Market Cap Cr"], errors="coerce")
         fii_all = fii_all.sort_values("Market Cap Cr", ascending=False, na_position="last").reset_index(drop=True)
     save_frame(fii_all, paths["fii_all"])
 

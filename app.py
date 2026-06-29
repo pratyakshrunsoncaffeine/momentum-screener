@@ -212,6 +212,7 @@ def recover_saved_fii_results(progress_callback=None) -> None:
             checkpoint_path=paths["fii_marketcap_partial"],
         )
         if "Market Cap Cr" in fii_all.columns:
+            fii_all["Market Cap Cr"] = pd.to_numeric(fii_all["Market Cap Cr"], errors="coerce")
             fii_all = fii_all.sort_values("Market Cap Cr", ascending=False, na_position="last").reset_index(drop=True)
         fii_all.to_csv(paths["fii_all"], index=False)
 
@@ -420,8 +421,8 @@ with tabs[4]:
     recover_fii = controls[3].button("Recover FII Scan", use_container_width=True)
 
     if run_fii:
-        fii_progress = make_progress("Scraping Screener.in FII holdings")
-        price_progress = make_progress("Fetching Yahoo Finance market caps and shortlist prices")
+        fii_progress = make_progress("Scraping Screener.in FII holdings and market caps")
+        price_progress = make_progress("Fetching shortlist prices")
         st.session_state["fii_results"] = run_fii_momentum_screen(
             csv_path,
             config,
@@ -443,6 +444,7 @@ with tabs[4]:
     fii_momentum = fii_results.get("fii_momentum", pd.DataFrame())
     fii_final = fii_results.get("fii_final", pd.DataFrame())
     if not fii_all.empty and "Market Cap Cr" in fii_all.columns:
+        fii_all["Market Cap Cr"] = pd.to_numeric(fii_all["Market Cap Cr"], errors="coerce")
         fii_all = fii_all.sort_values("Market Cap Cr", ascending=False, na_position="last").reset_index(drop=True)
 
     fii_metrics = st.columns(4)

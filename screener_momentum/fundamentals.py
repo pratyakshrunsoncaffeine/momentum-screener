@@ -112,6 +112,8 @@ def screen_fii_holdings(
             row = {
                 **item,
                 "Screener URL": screener_company_url(symbol),
+                "Market Cap": None,
+                "Market Cap Cr": None,
                 "FII Previous Period": None,
                 "FII Latest Period": None,
                 "FII Previous Holding %": None,
@@ -171,8 +173,11 @@ def fetch_company_fii_holding(
 
     soup = BeautifulSoup(response.text, "lxml")
     fii = extract_fii_holding_change(soup)
+    market_cap_cr = extract_market_cap(soup)
     return {
         "Screener URL": url,
+        "Market Cap": market_cap_cr * 10_000_000 if market_cap_cr is not None else None,
+        "Market Cap Cr": market_cap_cr,
         **fii,
     }
 

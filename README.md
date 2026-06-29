@@ -39,12 +39,14 @@ The `FII Accumulation` tab runs a separate workflow:
 
 1. Scrape the shareholding table for every ticker in `ticker.csv`.
 2. Calculate latest quarter FII holding change.
-3. Add Yahoo Finance market capitalization using `.NS` tickers.
+3. Read market capitalization from the same Screener.in page already being scraped.
 4. Sort the full FII scan by market cap from highest to lowest for export.
 5. Rank companies by positive FII holding change.
 6. Keep the top FII accumulation shortlist, default 50 companies.
 7. Run the existing momentum score only on that shortlist.
 8. Show the final top momentum picks, default 3 companies.
+
+Yahoo Finance is still used for price/momentum data and as a recovery fallback for older saved FII files that do not have market cap columns.
 
 Checkpoint files:
 
