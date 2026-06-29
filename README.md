@@ -33,6 +33,25 @@ The main checkpoint files are:
 - `output/latest/walk_forward_periods.csv`
 - `output/latest/current_allocation.csv`
 
+## FII Accumulation Screener
+
+The `FII Accumulation` tab runs a separate workflow:
+
+1. Scrape the shareholding table for every ticker in `ticker.csv`.
+2. Calculate latest quarter FII holding change.
+3. Rank companies by positive FII holding change.
+4. Keep the top FII accumulation shortlist, default 50 companies.
+5. Run the existing momentum score only on that shortlist.
+6. Show the final top momentum picks, default 3 companies.
+
+Checkpoint files:
+
+- `output/latest/fii_partial.csv`
+- `output/latest/fii_all.csv`
+- `output/latest/fii_top50.csv`
+- `output/latest/fii_momentum.csv`
+- `output/latest/fii_final.csv`
+
 ## Local Setup
 
 ```powershell

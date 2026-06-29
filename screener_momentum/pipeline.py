@@ -7,7 +7,7 @@ import pandas as pd
 
 from .backtest import current_allocation, performance_summary, walk_forward_backtest
 from .config import ScreeningConfig
-from .fundamentals import screen_fundamentals
+from .fundamentals import screen_fii_holdings, screen_fundamentals
 from .momentum import calculate_returns, download_adjusted_close, score_momentum
 from .universe import load_ticker_universe
 
@@ -30,6 +30,11 @@ def output_paths(output_dir: str | Path = "output/latest") -> dict[str, Path]:
         "current_allocation": root / "current_allocation.csv",
         "holdings": root / "holdings.csv",
         "performance": root / "performance.csv",
+        "fii_all": root / "fii_all.csv",
+        "fii_partial": root / "fii_partial.csv",
+        "fii_top": root / "fii_top50.csv",
+        "fii_momentum": root / "fii_momentum.csv",
+        "fii_final": root / "fii_final.csv",
     }
 
 
@@ -90,6 +95,61 @@ def run_momentum(
         output_dir=output_dir,
     )
     return score_and_save_momentum(returns, config, output_dir=output_dir)
+
+
+def run_fii_momentum_screen(
+    csv_path: str,
+    config: ScreeningConfig,
+    fii_top_n: int = 50,
+    final_n: int = 3,
+    progress_callback: ProgressCallback | None = None,
+    price_progress_callback: ProgressCallback | None = None,
+    output_dir: str | Path = "output/latest",
+) -> dict[str, pd.DataFrame]:
+    paths = output_paths(output_dir)
+    universe = load_ticker_universe(csv_path)
+    fii_all = screen_fii_holdings(
+        universe,
+        progress_callback=progress_callback,
+        checkpoint_path=paths["fii_partial"],
+    )
+    save_frame(fii_all, paths["fii_all"])
+
+    fii_ranked = fii_all.copy()
+    fii_ranked["FII Holding Change %"] = pd.to_numeric(fii_ranked["FII Holding Change %"], errors="coerce")
+    fii_top = (
+        fii_ranked[fii_ranked["FII Holding Change %"].gt(0)]
+        .sort_values("FII Holding Change %", ascending=False)
+        .head(int(fii_top_n))
+        .reset_index(drop=True)
+    )
+    save_frame(fii_top, paths["fii_top"])
+
+    if fii_top.empty:
+        fii_momentum = pd.DataFrame()
+        fii_final = pd.DataFrame()
+    else:
+        prices = download_adjusted_close(
+            fii_top["YFinance Ticker"].astype(str).tolist(),
+            batch_size=config.price_batch_size,
+            progress_callback=price_progress_callback,
+        )
+        returns = calculate_returns(fii_top, prices, progress_callback=price_progress_callback)
+        fii_momentum = score_momentum(
+            returns,
+            weights=config.momentum_weights,
+            positive_filters=config.positive_return_filters,
+        )
+        fii_final = fii_momentum.head(int(final_n)).reset_index(drop=True)
+
+    save_frame(fii_momentum, paths["fii_momentum"])
+    save_frame(fii_final, paths["fii_final"])
+    return {
+        "fii_all": fii_all,
+        "fii_top": fii_top,
+        "fii_momentum": fii_momentum,
+        "fii_final": fii_final,
+    }
 
 
 def run_fundamentals_screen(

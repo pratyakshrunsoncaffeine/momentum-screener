@@ -17,6 +17,7 @@ from screener_momentum.config import (
 from screener_momentum.pipeline import (
     load_saved_returns,
     output_paths,
+    run_fii_momentum_screen,
     run_fundamentals_screen,
     run_momentum,
     score_and_save_momentum,
@@ -153,7 +154,7 @@ def load_saved_run(config: ScreeningConfig) -> None:
 
 
 def read_csv_if_exists(path: Path, **kwargs) -> pd.DataFrame:
-    return pd.read_csv(path, **kwargs) if path.exists() else pd.DataFrame()
+    return pd.read_csv(path, **kwargs) if path.exists() and path.stat().st_size > 0 else pd.DataFrame()
 
 
 def recover_saved_results(config: ScreeningConfig) -> None:
@@ -196,6 +197,21 @@ def recover_saved_results(config: ScreeningConfig) -> None:
         "performance": performance,
     }
     st.success("Recovered saved screener files from output/latest.")
+
+
+def recover_saved_fii_results() -> None:
+    paths = output_paths(OUTPUT_DIR)
+    fii_results = {
+        "fii_all": read_csv_if_exists(paths["fii_all"]),
+        "fii_top": read_csv_if_exists(paths["fii_top"]),
+        "fii_momentum": read_csv_if_exists(paths["fii_momentum"]),
+        "fii_final": read_csv_if_exists(paths["fii_final"]),
+    }
+    if all(frame.empty for frame in fii_results.values()):
+        st.error("No saved FII scan files found yet.")
+        return
+    st.session_state["fii_results"] = fii_results
+    st.success("Recovered saved FII scan files from output/latest.")
 
 
 config, csv_path = build_config()
@@ -277,16 +293,23 @@ if run_fundamentals:
 results = st.session_state.get("results")
 if results is None:
     st.info("Refresh momentum data, or use saved momentum if a previous run exists.")
-    st.stop()
-
-momentum = results["momentum"]
-fundamentals = results["fundamentals"]
-final = results["final"]
-backtest = results["backtest"]
-normalized_backtest = results.get("normalized_backtest", pd.DataFrame())
-periods = results.get("periods", pd.DataFrame())
-holdings = results.get("holdings", pd.DataFrame())
-performance = results["performance"]
+    momentum = pd.DataFrame()
+    fundamentals = pd.DataFrame()
+    final = pd.DataFrame()
+    backtest = pd.DataFrame()
+    normalized_backtest = pd.DataFrame()
+    periods = pd.DataFrame()
+    holdings = pd.DataFrame()
+    performance = pd.DataFrame()
+else:
+    momentum = results["momentum"]
+    fundamentals = results["fundamentals"]
+    final = results["final"]
+    backtest = results["backtest"]
+    normalized_backtest = results.get("normalized_backtest", pd.DataFrame())
+    periods = results.get("periods", pd.DataFrame())
+    holdings = results.get("holdings", pd.DataFrame())
+    performance = results["performance"]
 
 metric_cols = st.columns(4)
 metric_cols[0].metric("Momentum Pass", f"{len(momentum):,}")
@@ -294,18 +317,24 @@ metric_cols[1].metric("Fundamental Rows", f"{len(fundamentals):,}" if not fundam
 metric_cols[2].metric("Final List", f"{len(final):,}")
 metric_cols[3].metric("Top Score", f"{final['Momentum Score'].max():.2f}" if not final.empty else "NA")
 
-tabs = st.tabs(["Final Screener", "Momentum", "Fundamentals", "Portfolio"])
+tabs = st.tabs(["Final Screener", "Momentum", "Fundamentals", "Portfolio", "FII Accumulation"])
 
 with tabs[0]:
     st.subheader("Final Momentum List")
-    st.dataframe(format_percent_columns(final), use_container_width=True, hide_index=True)
-    show_download("Download final list", final, "final_momentum_screener.csv")
+    if final.empty:
+        st.info("No final momentum list available yet.")
+    else:
+        st.dataframe(format_percent_columns(final), use_container_width=True, hide_index=True)
+        show_download("Download final list", final, "final_momentum_screener.csv")
 
 with tabs[1]:
     st.subheader("Momentum Candidates")
-    st.dataframe(format_percent_columns(momentum), use_container_width=True, hide_index=True)
-    show_download("Download momentum candidates", momentum, "momentum_candidates.csv")
-    st.caption(f"Saved at {paths['momentum']}")
+    if momentum.empty:
+        st.info("No momentum candidates available yet.")
+    else:
+        st.dataframe(format_percent_columns(momentum), use_container_width=True, hide_index=True)
+        show_download("Download momentum candidates", momentum, "momentum_candidates.csv")
+        st.caption(f"Saved at {paths['momentum']}")
 
 with tabs[2]:
     st.subheader("Screener.in Fundamentals")
@@ -363,3 +392,72 @@ with tabs[3]:
             st.markdown("Performance")
             scaled_performance = performance_summary(scaled_backtest)
             st.dataframe(scaled_performance if not scaled_performance.empty else performance, use_container_width=True, hide_index=True)
+
+with tabs[4]:
+    st.subheader("FII Accumulation + Momentum")
+    st.caption(
+        "This scanner scrapes FII holding change for the full ticker universe, ranks positive FII accumulation, "
+        "then momentum-scores only the top FII shortlist."
+    )
+    controls = st.columns([1, 1, 1, 1])
+    fii_top_n = controls[0].number_input("FII shortlist", min_value=10, max_value=200, value=50, step=5)
+    fii_final_n = controls[1].number_input("Final picks", min_value=1, max_value=20, value=3, step=1)
+    run_fii = controls[2].button("Run FII Scan", type="primary", use_container_width=True)
+    recover_fii = controls[3].button("Recover FII Scan", use_container_width=True)
+
+    if run_fii:
+        fii_progress = make_progress("Scraping Screener.in FII holdings")
+        price_progress = make_progress("Downloading prices for FII shortlist")
+        st.session_state["fii_results"] = run_fii_momentum_screen(
+            csv_path,
+            config,
+            fii_top_n=int(fii_top_n),
+            final_n=int(fii_final_n),
+            progress_callback=fii_progress,
+            price_progress_callback=price_progress,
+            output_dir=OUTPUT_DIR,
+        )
+        st.success("FII accumulation scan complete.")
+
+    if recover_fii:
+        recover_saved_fii_results()
+
+    fii_results = st.session_state.get("fii_results", {})
+    fii_all = fii_results.get("fii_all", pd.DataFrame())
+    fii_top = fii_results.get("fii_top", pd.DataFrame())
+    fii_momentum = fii_results.get("fii_momentum", pd.DataFrame())
+    fii_final = fii_results.get("fii_final", pd.DataFrame())
+
+    fii_metrics = st.columns(4)
+    fii_metrics[0].metric("Companies Scanned", f"{len(fii_all):,}" if not fii_all.empty else "0")
+    positive_count = int(pd.to_numeric(fii_all.get("FII Holding Change %", pd.Series(dtype=float)), errors="coerce").gt(0).sum()) if not fii_all.empty else 0
+    fii_metrics[1].metric("Positive FII Change", f"{positive_count:,}")
+    fii_metrics[2].metric("FII Shortlist", f"{len(fii_top):,}" if not fii_top.empty else "0")
+    fii_metrics[3].metric("Final Picks", f"{len(fii_final):,}" if not fii_final.empty else "0")
+
+    fii_tabs = st.tabs(["Final Top Picks", "Top FII Change", "Momentum on FII Shortlist", "All FII Scan"])
+    with fii_tabs[0]:
+        if fii_final.empty:
+            st.info("Run or recover an FII scan to see final picks.")
+        else:
+            st.dataframe(format_percent_columns(fii_final), use_container_width=True, hide_index=True)
+            show_download("Download FII final picks", fii_final, "fii_final.csv")
+    with fii_tabs[1]:
+        if fii_top.empty:
+            st.info("No positive FII shortlist available yet.")
+        else:
+            st.dataframe(format_percent_columns(fii_top), use_container_width=True, hide_index=True)
+            show_download("Download top FII change", fii_top, "fii_top50.csv")
+    with fii_tabs[2]:
+        if fii_momentum.empty:
+            st.info("No momentum-scored FII shortlist available yet.")
+        else:
+            st.dataframe(format_percent_columns(fii_momentum), use_container_width=True, hide_index=True)
+            show_download("Download FII momentum", fii_momentum, "fii_momentum.csv")
+    with fii_tabs[3]:
+        if fii_all.empty:
+            st.info("No full FII scan available yet. Full-universe scans can take a while because Screener.in is scraped company by company.")
+        else:
+            st.dataframe(format_percent_columns(fii_all), use_container_width=True, hide_index=True)
+            show_download("Download all FII scan", fii_all, "fii_all.csv")
+            st.caption(f"Partial checkpoints are written to {paths['fii_partial']}")

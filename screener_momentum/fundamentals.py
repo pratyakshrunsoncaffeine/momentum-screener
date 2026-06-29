@@ -78,6 +78,57 @@ def screen_fundamentals(
     return pd.DataFrame(rows)
 
 
+def screen_fii_holdings(
+    universe: pd.DataFrame,
+    sleep_seconds: float = 0.6,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    checkpoint_path: str | Path | None = None,
+) -> pd.DataFrame:
+    """Scrape Screener.in FII holding changes for a full ticker universe."""
+    if universe.empty:
+        return universe.copy()
+
+    rows: list[dict[str, Any]] = []
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    records = universe.to_dict("records")
+    total = len(records)
+    checkpoint = Path(checkpoint_path) if checkpoint_path else None
+    if checkpoint:
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+
+    for index, item in enumerate(records, start=1):
+        symbol = str(item["Ticker"]).strip().upper()
+        if progress_callback:
+            progress_callback(index - 1, total, f"Scraping FII holding for {symbol} ({index:,}/{total:,})")
+        try:
+            metrics = fetch_company_fii_holding(symbol, session=session)
+            row = {
+                **item,
+                **metrics,
+                "FII Scan Notes": "ok" if metrics.get("FII Holding Change %") is not None else "missing FII row",
+            }
+        except Exception as exc:
+            row = {
+                **item,
+                "Screener URL": screener_company_url(symbol),
+                "FII Previous Period": None,
+                "FII Latest Period": None,
+                "FII Previous Holding %": None,
+                "FII Latest Holding %": None,
+                "FII Holding Change %": None,
+                "FII Scan Notes": f"Screener fetch failed: {exc}",
+            }
+        rows.append(row)
+        if checkpoint:
+            pd.DataFrame(rows).to_csv(checkpoint, index=False)
+        if progress_callback:
+            progress_callback(index, total, f"Completed {index:,} of {total:,} FII scans")
+        time.sleep(sleep_seconds)
+
+    return pd.DataFrame(rows)
+
+
 def fetch_company_fundamentals(
     symbol: str,
     session: requests.Session | None = None,
@@ -100,6 +151,29 @@ def fetch_company_fundamentals(
         "Quarterly Revenue Growth %": extract_quarterly_sales_growth(soup),
         "Annual Revenue Growth %": extract_annual_sales_growth(soup),
         "Promoter Holding Change %": extract_promoter_holding_change(soup),
+    }
+
+
+def fetch_company_fii_holding(
+    symbol: str,
+    session: requests.Session | None = None,
+    timeout: int = 20,
+) -> dict[str, Any]:
+    session = session or requests.Session()
+    session.headers.update(HEADERS)
+
+    url = screener_company_url(symbol)
+    response = session.get(url, timeout=timeout)
+    if response.status_code == 404 and url.endswith("/consolidated/"):
+        url = url.replace("/consolidated/", "/")
+        response = session.get(url, timeout=timeout)
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "lxml")
+    fii = extract_fii_holding_change(soup)
+    return {
+        "Screener URL": url,
+        **fii,
     }
 
 
@@ -196,6 +270,33 @@ def extract_promoter_holding_change(soup: BeautifulSoup) -> float | None:
     return round(values[-1] - values[-2], 2)
 
 
+def extract_fii_holding_change(soup: BeautifulSoup) -> dict[str, Any]:
+    table = section_table(soup, "shareholding")
+    empty = {
+        "FII Previous Period": None,
+        "FII Latest Period": None,
+        "FII Previous Holding %": None,
+        "FII Latest Holding %": None,
+        "FII Holding Change %": None,
+    }
+    if table is None:
+        return empty
+    row = metric_row(table, ("FIIs", "FII", "Foreign Institutional", "Foreign Portfolio"))
+    values = numeric_values_with_periods(row, include_ttm=False)
+    if len(values) < 2:
+        return empty
+
+    previous_period, previous_value = values[-2]
+    latest_period, latest_value = values[-1]
+    return {
+        "FII Previous Period": previous_period,
+        "FII Latest Period": latest_period,
+        "FII Previous Holding %": round(previous_value, 2),
+        "FII Latest Holding %": round(latest_value, 2),
+        "FII Holding Change %": round(latest_value - previous_value, 2),
+    }
+
+
 def section_table(soup: BeautifulSoup, section_id: str) -> pd.DataFrame | None:
     section = soup.find(id=section_id)
     if section is None:
@@ -242,6 +343,20 @@ def numeric_values(row: pd.Series | None, include_ttm: bool) -> list[float]:
         parsed = parse_number(value)
         if parsed is not None:
             values.append(parsed)
+    return values
+
+
+def numeric_values_with_periods(row: pd.Series | None, include_ttm: bool) -> list[tuple[str, float]]:
+    if row is None:
+        return []
+    values: list[tuple[str, float]] = []
+    for column, value in row.iloc[1:].items():
+        period = str(column).strip()
+        if not include_ttm and period.upper() == "TTM":
+            continue
+        parsed = parse_number(value)
+        if parsed is not None:
+            values.append((period, parsed))
     return values
 
 
