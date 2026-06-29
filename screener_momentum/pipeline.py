@@ -33,6 +33,7 @@ def output_paths(output_dir: str | Path = "output/latest") -> dict[str, Path]:
         "performance": root / "performance.csv",
         "fii_all": root / "fii_all.csv",
         "fii_partial": root / "fii_partial.csv",
+        "fii_marketcap_partial": root / "fii_marketcap_partial.csv",
         "fii_top": root / "fii_top50.csv",
         "fii_momentum": root / "fii_momentum.csv",
         "fii_final": root / "fii_final.csv",
@@ -117,6 +118,7 @@ def run_fii_momentum_screen(
     fii_all = enrich_market_cap_from_yfinance(
         fii_all,
         progress_callback=price_progress_callback,
+        checkpoint_path=paths["fii_marketcap_partial"],
     )
     if "Market Cap Cr" in fii_all.columns:
         fii_all = fii_all.sort_values("Market Cap Cr", ascending=False, na_position="last").reset_index(drop=True)
@@ -162,31 +164,57 @@ def run_fii_momentum_screen(
 def enrich_market_cap_from_yfinance(
     frame: pd.DataFrame,
     progress_callback: ProgressCallback | None = None,
+    checkpoint_path: str | Path | None = None,
+    batch_size: int = 40,
 ) -> pd.DataFrame:
     """Add Yahoo Finance market-cap columns to a ticker frame."""
     if frame.empty or "YFinance Ticker" not in frame.columns:
         return frame
 
     result = frame.copy()
-    tickers = result["YFinance Ticker"].dropna().astype(str).str.upper().drop_duplicates().tolist()
+    if "Market Cap" not in result.columns:
+        result["Market Cap"] = pd.NA
+    if "Market Cap Cr" not in result.columns:
+        result["Market Cap Cr"] = pd.NA
+
+    ticker_series = result["YFinance Ticker"].dropna().astype(str).str.upper()
+    existing = pd.to_numeric(result["Market Cap"], errors="coerce")
+    missing_mask = existing.isna()
+    tickers = result.loc[missing_mask, "YFinance Ticker"].dropna().astype(str).str.upper().drop_duplicates().tolist()
     market_caps: dict[str, float | None] = {}
     total = len(tickers)
+    checkpoint = Path(checkpoint_path) if checkpoint_path else None
+    if checkpoint:
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
 
-    for index, ticker in enumerate(tickers, start=1):
+    for start in range(0, total, batch_size):
+        batch = tickers[start : start + batch_size]
         if progress_callback:
-            progress_callback(index - 1, total, f"Fetching market cap for {ticker}")
-        try:
-            info = yf.Ticker(ticker).fast_info
-            market_cap = getattr(info, "market_cap", None)
-            if market_cap is None:
-                market_cap = info.get("market_cap") if hasattr(info, "get") else None
-        except Exception:
-            market_cap = None
-        market_caps[ticker] = float(market_cap) if market_cap else None
-        if progress_callback:
-            progress_callback(index, total, f"Fetched market cap for {index:,} of {total:,} tickers")
+            progress_callback(start, total, f"Fetching market cap for {batch[0]} to {batch[-1]}")
+        tickers_obj = yf.Tickers(" ".join(batch))
+        for ticker in batch:
+            try:
+                info = tickers_obj.tickers[ticker].fast_info
+                market_cap = getattr(info, "market_cap", None)
+                if market_cap is None:
+                    market_cap = info.get("market_cap") if hasattr(info, "get") else None
+            except Exception:
+                market_cap = None
+            market_caps[ticker] = float(market_cap) if market_cap else None
 
-    result["Market Cap"] = result["YFinance Ticker"].astype(str).str.upper().map(market_caps)
+        completed = min(start + len(batch), total)
+        result["Market Cap"] = result["YFinance Ticker"].astype(str).str.upper().map(market_caps).combine_first(
+            pd.to_numeric(result["Market Cap"], errors="coerce")
+        )
+        result["Market Cap Cr"] = (pd.to_numeric(result["Market Cap"], errors="coerce") / 10_000_000).round(2)
+        if checkpoint:
+            result.sort_values("Market Cap Cr", ascending=False, na_position="last").to_csv(checkpoint, index=False)
+        if progress_callback:
+            progress_callback(completed, total, f"Fetched market cap for {completed:,} of {total:,} tickers")
+
+    if total == 0 and progress_callback:
+        progress_callback(0, 0, "Market cap already present")
+    result["Market Cap"] = ticker_series.map(market_caps).combine_first(pd.to_numeric(result["Market Cap"], errors="coerce"))
     result["Market Cap Cr"] = (pd.to_numeric(result["Market Cap"], errors="coerce") / 10_000_000).round(2)
     return result
 

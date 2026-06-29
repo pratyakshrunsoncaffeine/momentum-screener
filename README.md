@@ -49,6 +49,7 @@ The `FII Accumulation` tab runs a separate workflow:
 Checkpoint files:
 
 - `output/latest/fii_partial.csv`
+- `output/latest/fii_marketcap_partial.csv`
 - `output/latest/fii_all.csv`
 - `output/latest/fii_top50.csv`
 - `output/latest/fii_momentum.csv`

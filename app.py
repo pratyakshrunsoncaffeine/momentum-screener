@@ -15,6 +15,7 @@ from screener_momentum.config import (
     ScreeningConfig,
 )
 from screener_momentum.pipeline import (
+    enrich_market_cap_from_yfinance,
     load_saved_returns,
     output_paths,
     run_fii_momentum_screen,
@@ -199,10 +200,23 @@ def recover_saved_results(config: ScreeningConfig) -> None:
     st.success("Recovered saved screener files from output/latest.")
 
 
-def recover_saved_fii_results() -> None:
+def recover_saved_fii_results(progress_callback=None) -> None:
     paths = output_paths(OUTPUT_DIR)
+    fii_all = read_csv_if_exists(paths["fii_all"])
+    if fii_all.empty:
+        fii_all = read_csv_if_exists(paths["fii_marketcap_partial"])
+    if not fii_all.empty and ("Market Cap Cr" not in fii_all.columns or fii_all["Market Cap Cr"].isna().all()):
+        fii_all = enrich_market_cap_from_yfinance(
+            fii_all,
+            progress_callback=progress_callback,
+            checkpoint_path=paths["fii_marketcap_partial"],
+        )
+        if "Market Cap Cr" in fii_all.columns:
+            fii_all = fii_all.sort_values("Market Cap Cr", ascending=False, na_position="last").reset_index(drop=True)
+        fii_all.to_csv(paths["fii_all"], index=False)
+
     fii_results = {
-        "fii_all": read_csv_if_exists(paths["fii_all"]),
+        "fii_all": fii_all,
         "fii_top": read_csv_if_exists(paths["fii_top"]),
         "fii_momentum": read_csv_if_exists(paths["fii_momentum"]),
         "fii_final": read_csv_if_exists(paths["fii_final"]),
@@ -420,13 +434,16 @@ with tabs[4]:
         st.success("FII accumulation scan complete.")
 
     if recover_fii:
-        recover_saved_fii_results()
+        recover_progress = make_progress("Recovering saved FII scan and market caps")
+        recover_saved_fii_results(progress_callback=recover_progress)
 
     fii_results = st.session_state.get("fii_results", {})
     fii_all = fii_results.get("fii_all", pd.DataFrame())
     fii_top = fii_results.get("fii_top", pd.DataFrame())
     fii_momentum = fii_results.get("fii_momentum", pd.DataFrame())
     fii_final = fii_results.get("fii_final", pd.DataFrame())
+    if not fii_all.empty and "Market Cap Cr" in fii_all.columns:
+        fii_all = fii_all.sort_values("Market Cap Cr", ascending=False, na_position="last").reset_index(drop=True)
 
     fii_metrics = st.columns(4)
     fii_metrics[0].metric("Companies Scanned", f"{len(fii_all):,}" if not fii_all.empty else "0")
