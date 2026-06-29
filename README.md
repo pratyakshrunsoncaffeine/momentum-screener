@@ -39,10 +39,12 @@ The `FII Accumulation` tab runs a separate workflow:
 
 1. Scrape the shareholding table for every ticker in `ticker.csv`.
 2. Calculate latest quarter FII holding change.
-3. Rank companies by positive FII holding change.
-4. Keep the top FII accumulation shortlist, default 50 companies.
-5. Run the existing momentum score only on that shortlist.
-6. Show the final top momentum picks, default 3 companies.
+3. Add Yahoo Finance market capitalization using `.NS` tickers.
+4. Sort the full FII scan by market cap from highest to lowest for export.
+5. Rank companies by positive FII holding change.
+6. Keep the top FII accumulation shortlist, default 50 companies.
+7. Run the existing momentum score only on that shortlist.
+8. Show the final top momentum picks, default 3 companies.
 
 Checkpoint files:
 

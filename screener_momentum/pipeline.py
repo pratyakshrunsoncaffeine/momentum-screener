@@ -4,6 +4,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pandas as pd
+import yfinance as yf
 
 from .backtest import current_allocation, performance_summary, walk_forward_backtest
 from .config import ScreeningConfig
@@ -113,6 +114,12 @@ def run_fii_momentum_screen(
         progress_callback=progress_callback,
         checkpoint_path=paths["fii_partial"],
     )
+    fii_all = enrich_market_cap_from_yfinance(
+        fii_all,
+        progress_callback=price_progress_callback,
+    )
+    if "Market Cap Cr" in fii_all.columns:
+        fii_all = fii_all.sort_values("Market Cap Cr", ascending=False, na_position="last").reset_index(drop=True)
     save_frame(fii_all, paths["fii_all"])
 
     fii_ranked = fii_all.copy()
@@ -150,6 +157,38 @@ def run_fii_momentum_screen(
         "fii_momentum": fii_momentum,
         "fii_final": fii_final,
     }
+
+
+def enrich_market_cap_from_yfinance(
+    frame: pd.DataFrame,
+    progress_callback: ProgressCallback | None = None,
+) -> pd.DataFrame:
+    """Add Yahoo Finance market-cap columns to a ticker frame."""
+    if frame.empty or "YFinance Ticker" not in frame.columns:
+        return frame
+
+    result = frame.copy()
+    tickers = result["YFinance Ticker"].dropna().astype(str).str.upper().drop_duplicates().tolist()
+    market_caps: dict[str, float | None] = {}
+    total = len(tickers)
+
+    for index, ticker in enumerate(tickers, start=1):
+        if progress_callback:
+            progress_callback(index - 1, total, f"Fetching market cap for {ticker}")
+        try:
+            info = yf.Ticker(ticker).fast_info
+            market_cap = getattr(info, "market_cap", None)
+            if market_cap is None:
+                market_cap = info.get("market_cap") if hasattr(info, "get") else None
+        except Exception:
+            market_cap = None
+        market_caps[ticker] = float(market_cap) if market_cap else None
+        if progress_callback:
+            progress_callback(index, total, f"Fetched market cap for {index:,} of {total:,} tickers")
+
+    result["Market Cap"] = result["YFinance Ticker"].astype(str).str.upper().map(market_caps)
+    result["Market Cap Cr"] = (pd.to_numeric(result["Market Cap"], errors="coerce") / 10_000_000).round(2)
+    return result
 
 
 def run_fundamentals_screen(

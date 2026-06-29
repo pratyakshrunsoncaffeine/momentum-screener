@@ -407,7 +407,7 @@ with tabs[4]:
 
     if run_fii:
         fii_progress = make_progress("Scraping Screener.in FII holdings")
-        price_progress = make_progress("Downloading prices for FII shortlist")
+        price_progress = make_progress("Fetching Yahoo Finance market caps and shortlist prices")
         st.session_state["fii_results"] = run_fii_momentum_screen(
             csv_path,
             config,
