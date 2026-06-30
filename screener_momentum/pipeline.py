@@ -128,9 +128,41 @@ def run_fii_momentum_screen(
     if "Market Cap Cr" in fii_all.columns:
         fii_all["Market Cap Cr"] = pd.to_numeric(fii_all["Market Cap Cr"], errors="coerce")
         fii_all = fii_all.sort_values("Market Cap Cr", ascending=False, na_position="last").reset_index(drop=True)
+    return finalize_fii_momentum_screen(
+        fii_all,
+        config=config,
+        fii_top_n=fii_top_n,
+        final_n=final_n,
+        price_progress_callback=price_progress_callback,
+        output_dir=output_dir,
+    )
+
+
+def prepare_fii_all(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalize and sort the full FII scan for display/export."""
+    result = frame.copy()
+    if "Market Cap Cr" in result.columns:
+        result["Market Cap Cr"] = pd.to_numeric(result["Market Cap Cr"], errors="coerce")
+        result = result.sort_values("Market Cap Cr", ascending=False, na_position="last")
+    return result.reset_index(drop=True)
+
+
+def finalize_fii_momentum_screen(
+    fii_all: pd.DataFrame,
+    config: ScreeningConfig,
+    fii_top_n: int = 50,
+    final_n: int = 3,
+    price_progress_callback: ProgressCallback | None = None,
+    output_dir: str | Path = "output/latest",
+) -> dict[str, pd.DataFrame]:
+    """Save FII scan outputs and momentum-score the positive FII shortlist."""
+    paths = output_paths(output_dir)
+    fii_all = prepare_fii_all(fii_all)
     save_frame(fii_all, paths["fii_all"])
 
     fii_ranked = fii_all.copy()
+    if "FII Holding Change %" not in fii_ranked.columns:
+        fii_ranked["FII Holding Change %"] = pd.NA
     fii_ranked["FII Holding Change %"] = pd.to_numeric(fii_ranked["FII Holding Change %"], errors="coerce")
     fii_top = (
         fii_ranked[fii_ranked["FII Holding Change %"].gt(0)]
@@ -144,18 +176,24 @@ def run_fii_momentum_screen(
         fii_momentum = pd.DataFrame()
         fii_final = pd.DataFrame()
     else:
-        prices = download_adjusted_close(
-            fii_top["YFinance Ticker"].astype(str).tolist(),
-            batch_size=config.price_batch_size,
-            progress_callback=price_progress_callback,
-        )
-        returns = calculate_returns(fii_top, prices, progress_callback=price_progress_callback)
-        fii_momentum = score_momentum(
-            returns,
-            weights=config.momentum_weights,
-            positive_filters=config.positive_return_filters,
-        )
-        fii_final = fii_momentum.head(int(final_n)).reset_index(drop=True)
+        try:
+            prices = download_adjusted_close(
+                fii_top["YFinance Ticker"].astype(str).tolist(),
+                batch_size=config.price_batch_size,
+                progress_callback=price_progress_callback,
+            )
+            returns = calculate_returns(fii_top, prices, progress_callback=price_progress_callback)
+            fii_momentum = score_momentum(
+                returns,
+                weights=config.momentum_weights,
+                positive_filters=config.positive_return_filters,
+            )
+            fii_final = fii_momentum.head(int(final_n)).reset_index(drop=True)
+        except Exception as exc:
+            fii_momentum = pd.DataFrame(
+                [{"Momentum Error": f"Yahoo Finance price scoring failed after FII scan: {exc}"}]
+            )
+            fii_final = pd.DataFrame()
 
     save_frame(fii_momentum, paths["fii_momentum"])
     save_frame(fii_final, paths["fii_final"])

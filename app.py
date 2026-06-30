@@ -15,9 +15,10 @@ from screener_momentum.config import (
     ScreeningConfig,
 )
 from screener_momentum.pipeline import (
-    enrich_market_cap_from_yfinance,
+    finalize_fii_momentum_screen,
     load_saved_returns,
     output_paths,
+    prepare_fii_all,
     run_fii_momentum_screen,
     run_fundamentals_screen,
     run_momentum,
@@ -200,33 +201,59 @@ def recover_saved_results(config: ScreeningConfig) -> None:
     st.success("Recovered saved screener files from output/latest.")
 
 
-def recover_saved_fii_results(progress_callback=None) -> None:
-    paths = output_paths(OUTPUT_DIR)
-    fii_all = read_csv_if_exists(paths["fii_all"])
-    if fii_all.empty:
-        fii_all = read_csv_if_exists(paths["fii_marketcap_partial"])
-    if not fii_all.empty and ("Market Cap Cr" not in fii_all.columns or fii_all["Market Cap Cr"].isna().all()):
-        fii_all = enrich_market_cap_from_yfinance(
-            fii_all,
-            progress_callback=progress_callback,
-            checkpoint_path=paths["fii_marketcap_partial"],
-        )
-        if "Market Cap Cr" in fii_all.columns:
-            fii_all["Market Cap Cr"] = pd.to_numeric(fii_all["Market Cap Cr"], errors="coerce")
-            fii_all = fii_all.sort_values("Market Cap Cr", ascending=False, na_position="last").reset_index(drop=True)
-        fii_all.to_csv(paths["fii_all"], index=False)
+def latest_fii_source_path(paths: dict[str, Path]) -> Path | None:
+    candidates = [paths["fii_partial"], paths["fii_marketcap_partial"], paths["fii_all"]]
+    existing = [path for path in candidates if path.exists() and path.stat().st_size > 0]
+    if not existing:
+        return None
+    return max(existing, key=lambda path: path.stat().st_mtime)
 
-    fii_results = {
+
+def load_saved_fii_preview() -> dict[str, pd.DataFrame]:
+    paths = output_paths(OUTPUT_DIR)
+    source = latest_fii_source_path(paths)
+    fii_all = read_csv_if_exists(source) if source else pd.DataFrame()
+    if not fii_all.empty:
+        fii_all = prepare_fii_all(fii_all)
+    return {
         "fii_all": fii_all,
         "fii_top": read_csv_if_exists(paths["fii_top"]),
         "fii_momentum": read_csv_if_exists(paths["fii_momentum"]),
         "fii_final": read_csv_if_exists(paths["fii_final"]),
     }
+
+
+def recover_saved_fii_results(
+    config: ScreeningConfig,
+    fii_top_n: int,
+    fii_final_n: int,
+    progress_callback=None,
+) -> None:
+    paths = output_paths(OUTPUT_DIR)
+    source = latest_fii_source_path(paths)
+    fii_all = read_csv_if_exists(source) if source else pd.DataFrame()
+    if fii_all.empty:
+        st.error("No saved FII scan files found yet.")
+        return
+
+    if "Market Cap Cr" not in fii_all.columns or fii_all["Market Cap Cr"].isna().all():
+        st.warning(
+            "The newest saved FII scan does not contain market cap. Run or resume the FII scan once with the updated scraper."
+        )
+
+    fii_results = finalize_fii_momentum_screen(
+        fii_all,
+        config=config,
+        fii_top_n=fii_top_n,
+        final_n=fii_final_n,
+        price_progress_callback=progress_callback,
+        output_dir=OUTPUT_DIR,
+    )
     if all(frame.empty for frame in fii_results.values()):
         st.error("No saved FII scan files found yet.")
         return
     st.session_state["fii_results"] = fii_results
-    st.success("Recovered saved FII scan files from output/latest.")
+    st.success(f"Recovered and finalized saved FII scan from {source.name}.")
 
 
 config, csv_path = build_config()
@@ -417,26 +444,43 @@ with tabs[4]:
     controls = st.columns([1, 1, 1, 1])
     fii_top_n = controls[0].number_input("FII shortlist", min_value=10, max_value=200, value=50, step=5)
     fii_final_n = controls[1].number_input("Final picks", min_value=1, max_value=20, value=3, step=1)
-    run_fii = controls[2].button("Run FII Scan", type="primary", use_container_width=True)
-    recover_fii = controls[3].button("Recover FII Scan", use_container_width=True)
+    run_fii = controls[2].button("Run / Resume FII Scan", type="primary", use_container_width=True)
+    recover_fii = controls[3].button("Use Saved FII Scan", use_container_width=True)
 
     if run_fii:
         fii_progress = make_progress("Scraping Screener.in FII holdings and market caps")
         price_progress = make_progress("Fetching shortlist prices")
-        st.session_state["fii_results"] = run_fii_momentum_screen(
-            csv_path,
-            config,
-            fii_top_n=int(fii_top_n),
-            final_n=int(fii_final_n),
-            progress_callback=fii_progress,
-            price_progress_callback=price_progress,
-            output_dir=OUTPUT_DIR,
-        )
-        st.success("FII accumulation scan complete.")
+        try:
+            st.session_state["fii_results"] = run_fii_momentum_screen(
+                csv_path,
+                config,
+                fii_top_n=int(fii_top_n),
+                final_n=int(fii_final_n),
+                progress_callback=fii_progress,
+                price_progress_callback=price_progress,
+                output_dir=OUTPUT_DIR,
+            )
+            st.success("FII accumulation scan complete.")
+        except Exception as exc:
+            st.error(f"FII scan stopped before finalization: {exc}")
+            saved_preview = load_saved_fii_preview()
+            if not saved_preview["fii_all"].empty:
+                st.session_state["fii_results"] = saved_preview
+                st.warning("Loaded the latest saved FII checkpoint. Use Saved FII Scan can finalize it.")
 
     if recover_fii:
-        recover_progress = make_progress("Recovering saved FII scan and market caps")
-        recover_saved_fii_results(progress_callback=recover_progress)
+        recover_progress = make_progress("Finalizing saved FII scan")
+        recover_saved_fii_results(
+            config=config,
+            fii_top_n=int(fii_top_n),
+            fii_final_n=int(fii_final_n),
+            progress_callback=recover_progress,
+        )
+
+    if "fii_results" not in st.session_state:
+        saved_preview = load_saved_fii_preview()
+        if not saved_preview["fii_all"].empty:
+            st.session_state["fii_results"] = saved_preview
 
     fii_results = st.session_state.get("fii_results", {})
     fii_all = fii_results.get("fii_all", pd.DataFrame())
@@ -479,4 +523,4 @@ with tabs[4]:
         else:
             st.dataframe(format_percent_columns(fii_all), use_container_width=True, hide_index=True)
             show_download("Download all FII scan", fii_all, "fii_all.csv")
-            st.caption(f"Partial checkpoints are written to {paths['fii_partial']}")
+            st.caption(f"Partial checkpoints are written to {paths['fii_partial']}. Use Saved FII Scan finalizes the latest saved checkpoint.")

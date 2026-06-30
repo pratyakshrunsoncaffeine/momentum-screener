@@ -23,6 +23,7 @@ HEADERS = {
     ),
     "Accept-Language": "en-US,en;q=0.9",
 }
+RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 def screen_fundamentals(
@@ -83,12 +84,14 @@ def screen_fii_holdings(
     sleep_seconds: float = 0.6,
     progress_callback: Callable[[int, int, str], None] | None = None,
     checkpoint_path: str | Path | None = None,
+    checkpoint_every: int = 10,
 ) -> pd.DataFrame:
     """Scrape Screener.in FII holding changes for a full ticker universe."""
     if universe.empty:
         return universe.copy()
 
     rows: list[dict[str, Any]] = []
+    completed_tickers: set[str] = set()
     session = requests.Session()
     session.headers.update(HEADERS)
     records = universe.to_dict("records")
@@ -96,11 +99,14 @@ def screen_fii_holdings(
     checkpoint = Path(checkpoint_path) if checkpoint_path else None
     if checkpoint:
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        rows, completed_tickers = load_fii_checkpoint(checkpoint)
 
     for index, item in enumerate(records, start=1):
         symbol = str(item["Ticker"]).strip().upper()
+        if symbol in completed_tickers:
+            continue
         if progress_callback:
-            progress_callback(index - 1, total, f"Scraping FII holding for {symbol} ({index:,}/{total:,})")
+            progress_callback(len(completed_tickers), total, f"Scraping FII holding for {symbol} ({index:,}/{total:,})")
         try:
             metrics = fetch_company_fii_holding(symbol, session=session)
             row = {
@@ -122,13 +128,37 @@ def screen_fii_holdings(
                 "FII Scan Notes": f"Screener fetch failed: {exc}",
             }
         rows.append(row)
-        if checkpoint:
+        completed_tickers.add(symbol)
+        if checkpoint and (len(completed_tickers) == total or len(completed_tickers) % checkpoint_every == 0):
             pd.DataFrame(rows).to_csv(checkpoint, index=False)
         if progress_callback:
-            progress_callback(index, total, f"Completed {index:,} of {total:,} FII scans")
+            progress_callback(len(completed_tickers), total, f"Completed {len(completed_tickers):,} of {total:,} FII scans")
         time.sleep(sleep_seconds)
 
+    if checkpoint:
+        pd.DataFrame(rows).to_csv(checkpoint, index=False)
     return pd.DataFrame(rows)
+
+
+def load_fii_checkpoint(checkpoint: Path) -> tuple[list[dict[str, Any]], set[str]]:
+    """Resume a modern FII checkpoint and retry rows that previously failed."""
+    if not checkpoint.exists() or checkpoint.stat().st_size == 0:
+        return [], set()
+
+    try:
+        frame = pd.read_csv(checkpoint)
+    except Exception:
+        return [], set()
+
+    required_columns = {"Ticker", "Market Cap Cr", "FII Holding Change %", "FII Scan Notes"}
+    if frame.empty or not required_columns.issubset(frame.columns):
+        return [], set()
+
+    frame = frame.drop_duplicates(subset=["Ticker"], keep="last")
+    retry_mask = frame["FII Scan Notes"].astype(str).str.startswith("Screener fetch failed", na=False)
+    frame = frame[~retry_mask].copy()
+    tickers = set(frame["Ticker"].astype(str).str.strip().str.upper())
+    return frame.to_dict("records"), tickers
 
 
 def fetch_company_fundamentals(
@@ -139,14 +169,8 @@ def fetch_company_fundamentals(
     session = session or requests.Session()
     session.headers.update(HEADERS)
 
-    url = screener_company_url(symbol)
-    response = session.get(url, timeout=timeout)
-    if response.status_code == 404 and url.endswith("/consolidated/"):
-        url = url.replace("/consolidated/", "/")
-        response = session.get(url, timeout=timeout)
-    response.raise_for_status()
-
-    soup = BeautifulSoup(response.text, "lxml")
+    url, html = fetch_screener_html(symbol, session=session, timeout=timeout)
+    soup = BeautifulSoup(html, "lxml")
     return {
         "Screener URL": url,
         "Market Cap Cr": extract_market_cap(soup),
@@ -164,14 +188,8 @@ def fetch_company_fii_holding(
     session = session or requests.Session()
     session.headers.update(HEADERS)
 
-    url = screener_company_url(symbol)
-    response = session.get(url, timeout=timeout)
-    if response.status_code == 404 and url.endswith("/consolidated/"):
-        url = url.replace("/consolidated/", "/")
-        response = session.get(url, timeout=timeout)
-    response.raise_for_status()
-
-    soup = BeautifulSoup(response.text, "lxml")
+    url, html = fetch_screener_html(symbol, session=session, timeout=timeout)
+    soup = BeautifulSoup(html, "lxml")
     fii = extract_fii_holding_change(soup)
     market_cap_cr = extract_market_cap(soup)
     return {
@@ -184,6 +202,40 @@ def fetch_company_fii_holding(
 
 def screener_company_url(symbol: str) -> str:
     return f"https://www.screener.in/company/{quote(symbol, safe='')}/consolidated/"
+
+
+def fetch_screener_html(
+    symbol: str,
+    session: requests.Session,
+    timeout: int = 20,
+    max_attempts: int = 3,
+) -> tuple[str, str]:
+    """Fetch a Screener company page with small retries for rate limits/transient failures."""
+    url = screener_company_url(symbol)
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = session.get(url, timeout=timeout)
+            if response.status_code == 404 and url.endswith("/consolidated/"):
+                fallback_url = url.replace("/consolidated/", "/")
+                response = session.get(fallback_url, timeout=timeout)
+                effective_url = fallback_url
+            else:
+                effective_url = url
+
+            if response.status_code in RETRY_STATUS_CODES and attempt < max_attempts:
+                time.sleep(2.0 * attempt)
+                continue
+
+            response.raise_for_status()
+            return effective_url, response.text
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt >= max_attempts:
+                raise
+            time.sleep(2.0 * attempt)
+
+    raise RuntimeError(f"Screener fetch failed for {symbol}: {last_exc}")
 
 
 def passes_fundamental_filters(

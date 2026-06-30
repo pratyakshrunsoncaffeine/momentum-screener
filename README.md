@@ -48,6 +48,8 @@ The `FII Accumulation` tab runs a separate workflow:
 
 Yahoo Finance is still used for price/momentum data and as a recovery fallback for older saved FII files that do not have market cap columns.
 
+`Run / Resume FII Scan` writes checkpoints while it runs, so a stopped Streamlit run can continue from the saved rows instead of starting again. `Use Saved FII Scan` loads the newest saved FII file, including `fii_partial.csv`, and finalizes the top FII and momentum tables without re-scraping Screener.in.
+
 Checkpoint files:
 
 - `output/latest/fii_partial.csv`
