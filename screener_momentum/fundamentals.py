@@ -87,9 +87,50 @@ def screen_fii_holdings(
     checkpoint_every: int = 10,
 ) -> pd.DataFrame:
     """Scrape Screener.in FII holding changes for a full ticker universe."""
+    return screen_institutional_holdings(
+        universe,
+        holder_prefix="FII",
+        row_labels=("FIIs", "FII", "Foreign Institutional", "Foreign Portfolio"),
+        sleep_seconds=sleep_seconds,
+        progress_callback=progress_callback,
+        checkpoint_path=checkpoint_path,
+        checkpoint_every=checkpoint_every,
+    )
+
+
+def screen_dii_holdings(
+    universe: pd.DataFrame,
+    sleep_seconds: float = 0.6,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    checkpoint_path: str | Path | None = None,
+    checkpoint_every: int = 10,
+) -> pd.DataFrame:
+    """Scrape Screener.in DII holding changes for a full ticker universe."""
+    return screen_institutional_holdings(
+        universe,
+        holder_prefix="DII",
+        row_labels=("DIIs", "DII", "Domestic Institutional", "Domestic Institutions"),
+        sleep_seconds=sleep_seconds,
+        progress_callback=progress_callback,
+        checkpoint_path=checkpoint_path,
+        checkpoint_every=checkpoint_every,
+    )
+
+
+def screen_institutional_holdings(
+    universe: pd.DataFrame,
+    holder_prefix: str,
+    row_labels: tuple[str, ...],
+    sleep_seconds: float = 0.6,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    checkpoint_path: str | Path | None = None,
+    checkpoint_every: int = 10,
+) -> pd.DataFrame:
+    """Scrape Screener.in institutional holding changes for a full ticker universe."""
     if universe.empty:
         return universe.copy()
 
+    prefix = holder_prefix.upper()
     rows: list[dict[str, Any]] = []
     completed_tickers: set[str] = set()
     session = requests.Session()
@@ -99,20 +140,25 @@ def screen_fii_holdings(
     checkpoint = Path(checkpoint_path) if checkpoint_path else None
     if checkpoint:
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
-        rows, completed_tickers = load_fii_checkpoint(checkpoint)
+        rows, completed_tickers = load_institutional_checkpoint(checkpoint, prefix)
 
     for index, item in enumerate(records, start=1):
         symbol = str(item["Ticker"]).strip().upper()
         if symbol in completed_tickers:
             continue
         if progress_callback:
-            progress_callback(len(completed_tickers), total, f"Scraping FII holding for {symbol} ({index:,}/{total:,})")
+            progress_callback(len(completed_tickers), total, f"Scraping {prefix} holding for {symbol} ({index:,}/{total:,})")
         try:
-            metrics = fetch_company_fii_holding(symbol, session=session)
+            metrics = fetch_company_institutional_holding(
+                symbol,
+                holder_prefix=prefix,
+                row_labels=row_labels,
+                session=session,
+            )
             row = {
                 **item,
                 **metrics,
-                "FII Scan Notes": "ok" if metrics.get("FII Holding Change %") is not None else "missing FII row",
+                f"{prefix} Scan Notes": "ok" if metrics.get(f"{prefix} Holding Change %") is not None else f"missing {prefix} row",
             }
         except Exception as exc:
             row = {
@@ -120,19 +166,19 @@ def screen_fii_holdings(
                 "Screener URL": screener_company_url(symbol),
                 "Market Cap": None,
                 "Market Cap Cr": None,
-                "FII Previous Period": None,
-                "FII Latest Period": None,
-                "FII Previous Holding %": None,
-                "FII Latest Holding %": None,
-                "FII Holding Change %": None,
-                "FII Scan Notes": f"Screener fetch failed: {exc}",
+                f"{prefix} Previous Period": None,
+                f"{prefix} Latest Period": None,
+                f"{prefix} Previous Holding %": None,
+                f"{prefix} Latest Holding %": None,
+                f"{prefix} Holding Change %": None,
+                f"{prefix} Scan Notes": f"Screener fetch failed: {exc}",
             }
         rows.append(row)
         completed_tickers.add(symbol)
         if checkpoint and (len(completed_tickers) == total or len(completed_tickers) % checkpoint_every == 0):
             pd.DataFrame(rows).to_csv(checkpoint, index=False)
         if progress_callback:
-            progress_callback(len(completed_tickers), total, f"Completed {len(completed_tickers):,} of {total:,} FII scans")
+            progress_callback(len(completed_tickers), total, f"Completed {len(completed_tickers):,} of {total:,} {prefix} scans")
         time.sleep(sleep_seconds)
 
     if checkpoint:
@@ -142,6 +188,11 @@ def screen_fii_holdings(
 
 def load_fii_checkpoint(checkpoint: Path) -> tuple[list[dict[str, Any]], set[str]]:
     """Resume a modern FII checkpoint and retry rows that previously failed."""
+    return load_institutional_checkpoint(checkpoint, "FII")
+
+
+def load_institutional_checkpoint(checkpoint: Path, holder_prefix: str) -> tuple[list[dict[str, Any]], set[str]]:
+    """Resume a modern institutional checkpoint and retry rows that previously failed."""
     if not checkpoint.exists() or checkpoint.stat().st_size == 0:
         return [], set()
 
@@ -150,12 +201,13 @@ def load_fii_checkpoint(checkpoint: Path) -> tuple[list[dict[str, Any]], set[str
     except Exception:
         return [], set()
 
-    required_columns = {"Ticker", "Market Cap Cr", "FII Holding Change %", "FII Scan Notes"}
+    prefix = holder_prefix.upper()
+    required_columns = {"Ticker", "Market Cap Cr", f"{prefix} Holding Change %", f"{prefix} Scan Notes"}
     if frame.empty or not required_columns.issubset(frame.columns):
         return [], set()
 
     frame = frame.drop_duplicates(subset=["Ticker"], keep="last")
-    retry_mask = frame["FII Scan Notes"].astype(str).str.startswith("Screener fetch failed", na=False)
+    retry_mask = frame[f"{prefix} Scan Notes"].astype(str).str.startswith("Screener fetch failed", na=False)
     frame = frame[~retry_mask].copy()
     tickers = set(frame["Ticker"].astype(str).str.strip().str.upper())
     return frame.to_dict("records"), tickers
@@ -185,18 +237,49 @@ def fetch_company_fii_holding(
     session: requests.Session | None = None,
     timeout: int = 20,
 ) -> dict[str, Any]:
+    return fetch_company_institutional_holding(
+        symbol,
+        holder_prefix="FII",
+        row_labels=("FIIs", "FII", "Foreign Institutional", "Foreign Portfolio"),
+        session=session,
+        timeout=timeout,
+    )
+
+
+def fetch_company_dii_holding(
+    symbol: str,
+    session: requests.Session | None = None,
+    timeout: int = 20,
+) -> dict[str, Any]:
+    return fetch_company_institutional_holding(
+        symbol,
+        holder_prefix="DII",
+        row_labels=("DIIs", "DII", "Domestic Institutional", "Domestic Institutions"),
+        session=session,
+        timeout=timeout,
+    )
+
+
+def fetch_company_institutional_holding(
+    symbol: str,
+    holder_prefix: str,
+    row_labels: tuple[str, ...],
+    session: requests.Session | None = None,
+    timeout: int = 20,
+) -> dict[str, Any]:
     session = session or requests.Session()
     session.headers.update(HEADERS)
 
     url, html = fetch_screener_html(symbol, session=session, timeout=timeout)
     soup = BeautifulSoup(html, "lxml")
-    fii = extract_fii_holding_change(soup)
+    prefix = holder_prefix.upper()
+    holding = extract_institutional_holding_change(soup, prefix, row_labels)
     market_cap_cr = extract_market_cap(soup)
     return {
         "Screener URL": url,
         "Market Cap": market_cap_cr * 10_000_000 if market_cap_cr is not None else None,
         "Market Cap Cr": market_cap_cr,
-        **fii,
+        **holding,
     }
 
 
@@ -328,17 +411,38 @@ def extract_promoter_holding_change(soup: BeautifulSoup) -> float | None:
 
 
 def extract_fii_holding_change(soup: BeautifulSoup) -> dict[str, Any]:
+    return extract_institutional_holding_change(
+        soup,
+        "FII",
+        ("FIIs", "FII", "Foreign Institutional", "Foreign Portfolio"),
+    )
+
+
+def extract_dii_holding_change(soup: BeautifulSoup) -> dict[str, Any]:
+    return extract_institutional_holding_change(
+        soup,
+        "DII",
+        ("DIIs", "DII", "Domestic Institutional", "Domestic Institutions"),
+    )
+
+
+def extract_institutional_holding_change(
+    soup: BeautifulSoup,
+    holder_prefix: str,
+    row_labels: tuple[str, ...],
+) -> dict[str, Any]:
+    prefix = holder_prefix.upper()
     table = section_table(soup, "shareholding")
     empty = {
-        "FII Previous Period": None,
-        "FII Latest Period": None,
-        "FII Previous Holding %": None,
-        "FII Latest Holding %": None,
-        "FII Holding Change %": None,
+        f"{prefix} Previous Period": None,
+        f"{prefix} Latest Period": None,
+        f"{prefix} Previous Holding %": None,
+        f"{prefix} Latest Holding %": None,
+        f"{prefix} Holding Change %": None,
     }
     if table is None:
         return empty
-    row = metric_row(table, ("FIIs", "FII", "Foreign Institutional", "Foreign Portfolio"))
+    row = metric_row(table, row_labels)
     values = numeric_values_with_periods(row, include_ttm=False)
     if len(values) < 2:
         return empty
@@ -346,11 +450,11 @@ def extract_fii_holding_change(soup: BeautifulSoup) -> dict[str, Any]:
     previous_period, previous_value = values[-2]
     latest_period, latest_value = values[-1]
     return {
-        "FII Previous Period": previous_period,
-        "FII Latest Period": latest_period,
-        "FII Previous Holding %": round(previous_value, 2),
-        "FII Latest Holding %": round(latest_value, 2),
-        "FII Holding Change %": round(latest_value - previous_value, 2),
+        f"{prefix} Previous Period": previous_period,
+        f"{prefix} Latest Period": latest_period,
+        f"{prefix} Previous Holding %": round(previous_value, 2),
+        f"{prefix} Latest Holding %": round(latest_value, 2),
+        f"{prefix} Holding Change %": round(latest_value - previous_value, 2),
     }
 
 

@@ -8,7 +8,7 @@ import yfinance as yf
 
 from .backtest import current_allocation, performance_summary, walk_forward_backtest
 from .config import ScreeningConfig
-from .fundamentals import screen_fii_holdings, screen_fundamentals
+from .fundamentals import screen_dii_holdings, screen_fii_holdings, screen_fundamentals
 from .momentum import calculate_returns, download_adjusted_close, score_momentum
 from .universe import load_ticker_universe
 
@@ -37,6 +37,12 @@ def output_paths(output_dir: str | Path = "output/latest") -> dict[str, Path]:
         "fii_top": root / "fii_top50.csv",
         "fii_momentum": root / "fii_momentum.csv",
         "fii_final": root / "fii_final.csv",
+        "dii_all": root / "dii_all.csv",
+        "dii_partial": root / "dii_partial.csv",
+        "dii_marketcap_partial": root / "dii_marketcap_partial.csv",
+        "dii_top": root / "dii_top50.csv",
+        "dii_momentum": root / "dii_momentum.csv",
+        "dii_final": root / "dii_final.csv",
     }
 
 
@@ -138,8 +144,57 @@ def run_fii_momentum_screen(
     )
 
 
+def run_dii_momentum_screen(
+    csv_path: str,
+    config: ScreeningConfig,
+    dii_top_n: int = 50,
+    final_n: int = 3,
+    progress_callback: ProgressCallback | None = None,
+    price_progress_callback: ProgressCallback | None = None,
+    output_dir: str | Path = "output/latest",
+) -> dict[str, pd.DataFrame]:
+    paths = output_paths(output_dir)
+    universe = load_ticker_universe(csv_path)
+    dii_all = screen_dii_holdings(
+        universe,
+        progress_callback=progress_callback,
+        checkpoint_path=paths["dii_partial"],
+    )
+    needs_market_cap = "Market Cap Cr" not in dii_all.columns or pd.to_numeric(
+        dii_all.get("Market Cap Cr", pd.Series(dtype=float)),
+        errors="coerce",
+    ).isna().all()
+    if needs_market_cap:
+        dii_all = enrich_market_cap_from_yfinance(
+            dii_all,
+            progress_callback=price_progress_callback,
+            checkpoint_path=paths["dii_marketcap_partial"],
+        )
+    if "Market Cap Cr" in dii_all.columns:
+        dii_all["Market Cap Cr"] = pd.to_numeric(dii_all["Market Cap Cr"], errors="coerce")
+        dii_all = dii_all.sort_values("Market Cap Cr", ascending=False, na_position="last").reset_index(drop=True)
+    return finalize_dii_momentum_screen(
+        dii_all,
+        config=config,
+        dii_top_n=dii_top_n,
+        final_n=final_n,
+        price_progress_callback=price_progress_callback,
+        output_dir=output_dir,
+    )
+
+
 def prepare_fii_all(frame: pd.DataFrame) -> pd.DataFrame:
     """Normalize and sort the full FII scan for display/export."""
+    return prepare_institutional_all(frame)
+
+
+def prepare_dii_all(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalize and sort the full DII scan for display/export."""
+    return prepare_institutional_all(frame)
+
+
+def prepare_institutional_all(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalize and sort the full institutional scan for display/export."""
     result = frame.copy()
     if "Market Cap Cr" in result.columns:
         result["Market Cap Cr"] = pd.to_numeric(result["Market Cap Cr"], errors="coerce")
@@ -156,52 +211,101 @@ def finalize_fii_momentum_screen(
     output_dir: str | Path = "output/latest",
 ) -> dict[str, pd.DataFrame]:
     """Save FII scan outputs and momentum-score the positive FII shortlist."""
-    paths = output_paths(output_dir)
-    fii_all = prepare_fii_all(fii_all)
-    save_frame(fii_all, paths["fii_all"])
+    return finalize_institutional_momentum_screen(
+        all_scan=fii_all,
+        holder_prefix="FII",
+        config=config,
+        top_n=fii_top_n,
+        final_n=final_n,
+        price_progress_callback=price_progress_callback,
+        output_dir=output_dir,
+    )
 
-    fii_ranked = fii_all.copy()
-    if "FII Holding Change %" not in fii_ranked.columns:
-        fii_ranked["FII Holding Change %"] = pd.NA
-    fii_ranked["FII Holding Change %"] = pd.to_numeric(fii_ranked["FII Holding Change %"], errors="coerce")
-    fii_top = (
-        fii_ranked[fii_ranked["FII Holding Change %"].gt(0)]
-        .sort_values("FII Holding Change %", ascending=False)
-        .head(int(fii_top_n))
+
+def finalize_dii_momentum_screen(
+    dii_all: pd.DataFrame,
+    config: ScreeningConfig,
+    dii_top_n: int = 50,
+    final_n: int = 3,
+    price_progress_callback: ProgressCallback | None = None,
+    output_dir: str | Path = "output/latest",
+) -> dict[str, pd.DataFrame]:
+    """Save DII scan outputs and momentum-score the positive DII shortlist."""
+    return finalize_institutional_momentum_screen(
+        all_scan=dii_all,
+        holder_prefix="DII",
+        config=config,
+        top_n=dii_top_n,
+        final_n=final_n,
+        price_progress_callback=price_progress_callback,
+        output_dir=output_dir,
+    )
+
+
+def finalize_institutional_momentum_screen(
+    all_scan: pd.DataFrame,
+    holder_prefix: str,
+    config: ScreeningConfig,
+    top_n: int = 50,
+    final_n: int = 3,
+    price_progress_callback: ProgressCallback | None = None,
+    output_dir: str | Path = "output/latest",
+) -> dict[str, pd.DataFrame]:
+    """Save institutional scan outputs and momentum-score the positive accumulation shortlist."""
+    paths = output_paths(output_dir)
+    prefix = holder_prefix.lower()
+    label = holder_prefix.upper()
+    all_key = f"{prefix}_all"
+    top_key = f"{prefix}_top"
+    momentum_key = f"{prefix}_momentum"
+    final_key = f"{prefix}_final"
+    change_column = f"{label} Holding Change %"
+
+    all_scan = prepare_institutional_all(all_scan)
+    save_frame(all_scan, paths[all_key])
+
+    ranked = all_scan.copy()
+    if change_column not in ranked.columns:
+        ranked[change_column] = pd.NA
+    ranked[change_column] = pd.to_numeric(ranked[change_column], errors="coerce")
+    top = (
+        ranked[ranked[change_column].gt(0)]
+        .sort_values(change_column, ascending=False)
+        .head(int(top_n))
         .reset_index(drop=True)
     )
-    save_frame(fii_top, paths["fii_top"])
+    save_frame(top, paths[top_key])
 
-    if fii_top.empty:
-        fii_momentum = pd.DataFrame()
-        fii_final = pd.DataFrame()
+    if top.empty:
+        momentum = pd.DataFrame()
+        final = pd.DataFrame()
     else:
         try:
             prices = download_adjusted_close(
-                fii_top["YFinance Ticker"].astype(str).tolist(),
+                top["YFinance Ticker"].astype(str).tolist(),
                 batch_size=config.price_batch_size,
                 progress_callback=price_progress_callback,
             )
-            returns = calculate_returns(fii_top, prices, progress_callback=price_progress_callback)
-            fii_momentum = score_momentum(
+            returns = calculate_returns(top, prices, progress_callback=price_progress_callback)
+            momentum = score_momentum(
                 returns,
                 weights=config.momentum_weights,
                 positive_filters=config.positive_return_filters,
             )
-            fii_final = fii_momentum.head(int(final_n)).reset_index(drop=True)
+            final = momentum.head(int(final_n)).reset_index(drop=True)
         except Exception as exc:
-            fii_momentum = pd.DataFrame(
-                [{"Momentum Error": f"Yahoo Finance price scoring failed after FII scan: {exc}"}]
+            momentum = pd.DataFrame(
+                [{"Momentum Error": f"Yahoo Finance price scoring failed after {label} scan: {exc}"}]
             )
-            fii_final = pd.DataFrame()
+            final = pd.DataFrame()
 
-    save_frame(fii_momentum, paths["fii_momentum"])
-    save_frame(fii_final, paths["fii_final"])
+    save_frame(momentum, paths[momentum_key])
+    save_frame(final, paths[final_key])
     return {
-        "fii_all": fii_all,
-        "fii_top": fii_top,
-        "fii_momentum": fii_momentum,
-        "fii_final": fii_final,
+        all_key: all_scan,
+        top_key: top,
+        momentum_key: momentum,
+        final_key: final,
     }
 
 

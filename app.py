@@ -15,10 +15,13 @@ from screener_momentum.config import (
     ScreeningConfig,
 )
 from screener_momentum.pipeline import (
+    finalize_dii_momentum_screen,
     finalize_fii_momentum_screen,
     load_saved_returns,
     output_paths,
+    prepare_dii_all,
     prepare_fii_all,
+    run_dii_momentum_screen,
     run_fii_momentum_screen,
     run_fundamentals_screen,
     run_momentum,
@@ -202,7 +205,15 @@ def recover_saved_results(config: ScreeningConfig) -> None:
 
 
 def latest_fii_source_path(paths: dict[str, Path]) -> Path | None:
-    candidates = [paths["fii_partial"], paths["fii_marketcap_partial"], paths["fii_all"]]
+    return latest_institutional_source_path(paths, "fii")
+
+
+def latest_dii_source_path(paths: dict[str, Path]) -> Path | None:
+    return latest_institutional_source_path(paths, "dii")
+
+
+def latest_institutional_source_path(paths: dict[str, Path], prefix: str) -> Path | None:
+    candidates = [paths[f"{prefix}_partial"], paths[f"{prefix}_marketcap_partial"], paths[f"{prefix}_all"]]
     existing = [path for path in candidates if path.exists() and path.stat().st_size > 0]
     if not existing:
         return None
@@ -210,16 +221,24 @@ def latest_fii_source_path(paths: dict[str, Path]) -> Path | None:
 
 
 def load_saved_fii_preview() -> dict[str, pd.DataFrame]:
+    return load_saved_institutional_preview("fii", prepare_fii_all)
+
+
+def load_saved_dii_preview() -> dict[str, pd.DataFrame]:
+    return load_saved_institutional_preview("dii", prepare_dii_all)
+
+
+def load_saved_institutional_preview(prefix: str, prepare_func) -> dict[str, pd.DataFrame]:
     paths = output_paths(OUTPUT_DIR)
-    source = latest_fii_source_path(paths)
-    fii_all = read_csv_if_exists(source) if source else pd.DataFrame()
-    if not fii_all.empty:
-        fii_all = prepare_fii_all(fii_all)
+    source = latest_institutional_source_path(paths, prefix)
+    all_scan = read_csv_if_exists(source) if source else pd.DataFrame()
+    if not all_scan.empty:
+        all_scan = prepare_func(all_scan)
     return {
-        "fii_all": fii_all,
-        "fii_top": read_csv_if_exists(paths["fii_top"]),
-        "fii_momentum": read_csv_if_exists(paths["fii_momentum"]),
-        "fii_final": read_csv_if_exists(paths["fii_final"]),
+        f"{prefix}_all": all_scan,
+        f"{prefix}_top": read_csv_if_exists(paths[f"{prefix}_top"]),
+        f"{prefix}_momentum": read_csv_if_exists(paths[f"{prefix}_momentum"]),
+        f"{prefix}_final": read_csv_if_exists(paths[f"{prefix}_final"]),
     }
 
 
@@ -229,31 +248,71 @@ def recover_saved_fii_results(
     fii_final_n: int,
     progress_callback=None,
 ) -> None:
+    recover_saved_institutional_results(
+        prefix="fii",
+        label="FII",
+        config=config,
+        top_n=fii_top_n,
+        final_n=fii_final_n,
+        finalizer=finalize_fii_momentum_screen,
+        state_key="fii_results",
+        progress_callback=progress_callback,
+    )
+
+
+def recover_saved_dii_results(
+    config: ScreeningConfig,
+    dii_top_n: int,
+    dii_final_n: int,
+    progress_callback=None,
+) -> None:
+    recover_saved_institutional_results(
+        prefix="dii",
+        label="DII",
+        config=config,
+        top_n=dii_top_n,
+        final_n=dii_final_n,
+        finalizer=finalize_dii_momentum_screen,
+        state_key="dii_results",
+        progress_callback=progress_callback,
+    )
+
+
+def recover_saved_institutional_results(
+    prefix: str,
+    label: str,
+    config: ScreeningConfig,
+    top_n: int,
+    final_n: int,
+    finalizer,
+    state_key: str,
+    progress_callback=None,
+) -> None:
     paths = output_paths(OUTPUT_DIR)
-    source = latest_fii_source_path(paths)
-    fii_all = read_csv_if_exists(source) if source else pd.DataFrame()
-    if fii_all.empty:
-        st.error("No saved FII scan files found yet.")
+    source = latest_institutional_source_path(paths, prefix)
+    all_scan = read_csv_if_exists(source) if source else pd.DataFrame()
+    if all_scan.empty:
+        st.error(f"No saved {label} scan files found yet.")
         return
 
-    if "Market Cap Cr" not in fii_all.columns or fii_all["Market Cap Cr"].isna().all():
+    if "Market Cap Cr" not in all_scan.columns or all_scan["Market Cap Cr"].isna().all():
         st.warning(
-            "The newest saved FII scan does not contain market cap. Run or resume the FII scan once with the updated scraper."
+            f"The newest saved {label} scan does not contain market cap. Run or resume the {label} scan once with the updated scraper."
         )
 
-    fii_results = finalize_fii_momentum_screen(
-        fii_all,
+    results = finalizer(
+        all_scan,
         config=config,
-        fii_top_n=fii_top_n,
-        final_n=fii_final_n,
+        **{f"{prefix}_top_n": top_n},
+        final_n=final_n,
         price_progress_callback=progress_callback,
         output_dir=OUTPUT_DIR,
     )
-    if all(frame.empty for frame in fii_results.values()):
-        st.error("No saved FII scan files found yet.")
+    if all(frame.empty for frame in results.values()):
+        st.error(f"No saved {label} scan files found yet.")
         return
-    st.session_state["fii_results"] = fii_results
-    st.success(f"Recovered and finalized saved FII scan from {source.name}.")
+    st.session_state[state_key] = results
+    st.success(f"Recovered and finalized saved {label} scan from {source.name}.")
 
 
 config, csv_path = build_config()
@@ -359,7 +418,7 @@ metric_cols[1].metric("Fundamental Rows", f"{len(fundamentals):,}" if not fundam
 metric_cols[2].metric("Final List", f"{len(final):,}")
 metric_cols[3].metric("Top Score", f"{final['Momentum Score'].max():.2f}" if not final.empty else "NA")
 
-tabs = st.tabs(["Final Screener", "Momentum", "Fundamentals", "Portfolio", "FII Accumulation"])
+tabs = st.tabs(["Final Screener", "Momentum", "Fundamentals", "Portfolio", "FII Accumulation", "DII Accumulation"])
 
 with tabs[0]:
     st.subheader("Final Momentum List")
@@ -524,3 +583,93 @@ with tabs[4]:
             st.dataframe(format_percent_columns(fii_all), use_container_width=True, hide_index=True)
             show_download("Download all FII scan", fii_all, "fii_all.csv")
             st.caption(f"Partial checkpoints are written to {paths['fii_partial']}. Use Saved FII Scan finalizes the latest saved checkpoint.")
+
+with tabs[5]:
+    st.subheader("DII Accumulation + Momentum")
+    st.caption(
+        "This scanner scrapes DII holding change for the full ticker universe, ranks positive DII accumulation, "
+        "then momentum-scores only the top DII shortlist."
+    )
+    controls = st.columns([1, 1, 1, 1])
+    dii_top_n = controls[0].number_input("DII shortlist", min_value=10, max_value=200, value=50, step=5)
+    dii_final_n = controls[1].number_input("DII final picks", min_value=1, max_value=20, value=3, step=1)
+    run_dii = controls[2].button("Run / Resume DII Scan", type="primary", use_container_width=True)
+    recover_dii = controls[3].button("Use Saved DII Scan", use_container_width=True)
+
+    if run_dii:
+        dii_progress = make_progress("Scraping Screener.in DII holdings and market caps")
+        price_progress = make_progress("Fetching DII shortlist prices")
+        try:
+            st.session_state["dii_results"] = run_dii_momentum_screen(
+                csv_path,
+                config,
+                dii_top_n=int(dii_top_n),
+                final_n=int(dii_final_n),
+                progress_callback=dii_progress,
+                price_progress_callback=price_progress,
+                output_dir=OUTPUT_DIR,
+            )
+            st.success("DII accumulation scan complete.")
+        except Exception as exc:
+            st.error(f"DII scan stopped before finalization: {exc}")
+            saved_preview = load_saved_dii_preview()
+            if not saved_preview["dii_all"].empty:
+                st.session_state["dii_results"] = saved_preview
+                st.warning("Loaded the latest saved DII checkpoint. Use Saved DII Scan can finalize it.")
+
+    if recover_dii:
+        recover_progress = make_progress("Finalizing saved DII scan")
+        recover_saved_dii_results(
+            config=config,
+            dii_top_n=int(dii_top_n),
+            dii_final_n=int(dii_final_n),
+            progress_callback=recover_progress,
+        )
+
+    if "dii_results" not in st.session_state:
+        saved_preview = load_saved_dii_preview()
+        if not saved_preview["dii_all"].empty:
+            st.session_state["dii_results"] = saved_preview
+
+    dii_results = st.session_state.get("dii_results", {})
+    dii_all = dii_results.get("dii_all", pd.DataFrame())
+    dii_top = dii_results.get("dii_top", pd.DataFrame())
+    dii_momentum = dii_results.get("dii_momentum", pd.DataFrame())
+    dii_final = dii_results.get("dii_final", pd.DataFrame())
+    if not dii_all.empty and "Market Cap Cr" in dii_all.columns:
+        dii_all["Market Cap Cr"] = pd.to_numeric(dii_all["Market Cap Cr"], errors="coerce")
+        dii_all = dii_all.sort_values("Market Cap Cr", ascending=False, na_position="last").reset_index(drop=True)
+
+    dii_metrics = st.columns(4)
+    dii_metrics[0].metric("Companies Scanned", f"{len(dii_all):,}" if not dii_all.empty else "0")
+    positive_count = int(pd.to_numeric(dii_all.get("DII Holding Change %", pd.Series(dtype=float)), errors="coerce").gt(0).sum()) if not dii_all.empty else 0
+    dii_metrics[1].metric("Positive DII Change", f"{positive_count:,}")
+    dii_metrics[2].metric("DII Shortlist", f"{len(dii_top):,}" if not dii_top.empty else "0")
+    dii_metrics[3].metric("Final Picks", f"{len(dii_final):,}" if not dii_final.empty else "0")
+
+    dii_tabs = st.tabs(["Final Top Picks", "Top DII Change", "Momentum on DII Shortlist", "All DII Scan"])
+    with dii_tabs[0]:
+        if dii_final.empty:
+            st.info("Run or recover a DII scan to see final picks.")
+        else:
+            st.dataframe(format_percent_columns(dii_final), use_container_width=True, hide_index=True)
+            show_download("Download DII final picks", dii_final, "dii_final.csv")
+    with dii_tabs[1]:
+        if dii_top.empty:
+            st.info("No positive DII shortlist available yet.")
+        else:
+            st.dataframe(format_percent_columns(dii_top), use_container_width=True, hide_index=True)
+            show_download("Download top DII change", dii_top, "dii_top50.csv")
+    with dii_tabs[2]:
+        if dii_momentum.empty:
+            st.info("No momentum-scored DII shortlist available yet.")
+        else:
+            st.dataframe(format_percent_columns(dii_momentum), use_container_width=True, hide_index=True)
+            show_download("Download DII momentum", dii_momentum, "dii_momentum.csv")
+    with dii_tabs[3]:
+        if dii_all.empty:
+            st.info("No full DII scan available yet. Full-universe scans can take a while because Screener.in is scraped company by company.")
+        else:
+            st.dataframe(format_percent_columns(dii_all), use_container_width=True, hide_index=True)
+            show_download("Download all DII scan", dii_all, "dii_all.csv")
+            st.caption(f"Partial checkpoints are written to {paths['dii_partial']}. Use Saved DII Scan finalizes the latest saved checkpoint.")

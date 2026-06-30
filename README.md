@@ -33,22 +33,22 @@ The main checkpoint files are:
 - `output/latest/walk_forward_periods.csv`
 - `output/latest/current_allocation.csv`
 
-## FII Accumulation Screener
+## FII And DII Accumulation Screeners
 
-The `FII Accumulation` tab runs a separate workflow:
+The `FII Accumulation` and `DII Accumulation` tabs run separate but parallel workflows:
 
 1. Scrape the shareholding table for every ticker in `ticker.csv`.
-2. Calculate latest quarter FII holding change.
+2. Calculate latest quarter FII or DII holding change.
 3. Read market capitalization from the same Screener.in page already being scraped.
-4. Sort the full FII scan by market cap from highest to lowest for export.
-5. Rank companies by positive FII holding change.
-6. Keep the top FII accumulation shortlist, default 50 companies.
+4. Sort the full scan by market cap from highest to lowest for export.
+5. Rank companies by positive institutional holding change.
+6. Keep the top accumulation shortlist, default 50 companies.
 7. Run the existing momentum score only on that shortlist.
 8. Show the final top momentum picks, default 3 companies.
 
-Yahoo Finance is still used for price/momentum data and as a recovery fallback for older saved FII files that do not have market cap columns.
+Yahoo Finance is still used for price/momentum data and as a recovery fallback for older saved institutional files that do not have market cap columns.
 
-`Run / Resume FII Scan` writes checkpoints while it runs, so a stopped Streamlit run can continue from the saved rows instead of starting again. `Use Saved FII Scan` loads the newest saved FII file, including `fii_partial.csv`, and finalizes the top FII and momentum tables without re-scraping Screener.in.
+`Run / Resume FII Scan` and `Run / Resume DII Scan` write checkpoints while they run, so a stopped Streamlit run can continue from the saved rows instead of starting again. `Use Saved FII Scan` and `Use Saved DII Scan` load the newest saved file, including partial checkpoints, and finalize the top accumulation and momentum tables without re-scraping Screener.in.
 
 Checkpoint files:
 
@@ -58,6 +58,12 @@ Checkpoint files:
 - `output/latest/fii_top50.csv`
 - `output/latest/fii_momentum.csv`
 - `output/latest/fii_final.csv`
+- `output/latest/dii_partial.csv`
+- `output/latest/dii_marketcap_partial.csv`
+- `output/latest/dii_all.csv`
+- `output/latest/dii_top50.csv`
+- `output/latest/dii_momentum.csv`
+- `output/latest/dii_final.csv`
 
 ## Local Setup
 
