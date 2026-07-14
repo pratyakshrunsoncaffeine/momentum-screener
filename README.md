@@ -65,6 +65,19 @@ Checkpoint files:
 - `output/latest/dii_momentum.csv`
 - `output/latest/dii_final.csv`
 
+## Quarterly Results Growth Scanner
+
+The `Quarterly Results` tab scans every ticker in `ticker.csv` using the existing Screener.in company-page workflow. Enter the period exactly as a quarterly table label, such as `Jun 2026`. The scanner keeps companies whose table contains that period and calculates both comparisons for Sales, Operating Profit, Net Profit, and EPS:
+
+- QoQ: selected result quarter versus the immediately preceding quarter, for example `Jun 2026` versus `Mar 2026`.
+- YoY: selected result quarter versus the same quarter one year earlier, for example `Jun 2026` versus `Jun 2025`.
+
+Use the `Rank by YoY growth` control to sort the results by Sales, Operating Profit, Net Profit, or EPS without running the scrape again. The full scan and the matching-quarter subset are saved separately, and checkpoints resume only when they belong to the same requested quarter.
+
+- `output/latest/quarterly_results_partial.csv`
+- `output/latest/quarterly_results_all.csv`
+- `output/latest/quarterly_results_matching.csv`
+
 ## Local Setup
 
 ```powershell

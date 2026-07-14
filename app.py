@@ -17,13 +17,16 @@ from screener_momentum.config import (
 from screener_momentum.pipeline import (
     finalize_dii_momentum_screen,
     finalize_fii_momentum_screen,
+    finalize_quarterly_results_screen,
     load_saved_returns,
     output_paths,
     prepare_dii_all,
     prepare_fii_all,
+    prepare_quarterly_results,
     run_dii_momentum_screen,
     run_fii_momentum_screen,
     run_fundamentals_screen,
+    run_quarterly_results_screen,
     run_momentum,
     score_and_save_momentum,
 )
@@ -315,6 +318,38 @@ def recover_saved_institutional_results(
     st.success(f"Recovered and finalized saved {label} scan from {source.name}.")
 
 
+def latest_quarterly_source_path(paths: dict[str, Path]) -> Path | None:
+    candidates = [paths["quarterly_results_partial"], paths["quarterly_results_all"]]
+    existing = [path for path in candidates if path.exists() and path.stat().st_size > 0]
+    return max(existing, key=lambda path: path.stat().st_mtime) if existing else None
+
+
+def load_saved_quarterly_preview(target_period: str) -> dict[str, pd.DataFrame]:
+    paths = output_paths(OUTPUT_DIR)
+    source = latest_quarterly_source_path(paths)
+    all_scan = read_csv_if_exists(source) if source else pd.DataFrame()
+    return {
+        "quarterly_all": all_scan,
+        "quarterly_matching": prepare_quarterly_results(all_scan, target_period=target_period),
+    }
+
+
+def recover_saved_quarterly_results(target_period: str) -> None:
+    paths = output_paths(OUTPUT_DIR)
+    source = latest_quarterly_source_path(paths)
+    all_scan = read_csv_if_exists(source) if source else pd.DataFrame()
+    if all_scan.empty:
+        st.error("No saved quarterly-results scan files found yet.")
+        return
+    matching_target = prepare_quarterly_results(all_scan, target_period=target_period, matching_only=False)
+    if matching_target.empty:
+        st.warning("The saved scan belongs to a different result quarter. Run a new scan for this quarter.")
+        return
+    results = finalize_quarterly_results_screen(all_scan, target_period=target_period, output_dir=OUTPUT_DIR)
+    st.session_state["quarterly_results"] = results
+    st.success(f"Recovered saved quarterly results from {source.name}.")
+
+
 config, csv_path = build_config()
 
 st.title("Momentum Screener")
@@ -418,7 +453,17 @@ metric_cols[1].metric("Fundamental Rows", f"{len(fundamentals):,}" if not fundam
 metric_cols[2].metric("Final List", f"{len(final):,}")
 metric_cols[3].metric("Top Score", f"{final['Momentum Score'].max():.2f}" if not final.empty else "NA")
 
-tabs = st.tabs(["Final Screener", "Momentum", "Fundamentals", "Portfolio", "FII Accumulation", "DII Accumulation"])
+tabs = st.tabs(
+    [
+        "Final Screener",
+        "Momentum",
+        "Fundamentals",
+        "Portfolio",
+        "FII Accumulation",
+        "DII Accumulation",
+        "Quarterly Results",
+    ]
+)
 
 with tabs[0]:
     st.subheader("Final Momentum List")
@@ -673,3 +718,87 @@ with tabs[5]:
             st.dataframe(format_percent_columns(dii_all), use_container_width=True, hide_index=True)
             show_download("Download all DII scan", dii_all, "dii_all.csv")
             st.caption(f"Partial checkpoints are written to {paths['dii_partial']}. Use Saved DII Scan finalizes the latest saved checkpoint.")
+
+with tabs[6]:
+    st.subheader("Quarterly Results Growth Scanner")
+    st.caption(
+        "Scans the full ticker universe on Screener.in. It keeps companies whose quarterly table contains the "
+        "selected result period, then compares Sales, Operating Profit, Net Profit, and EPS with the previous "
+        "quarter and the same quarter one year earlier."
+    )
+    controls = st.columns([1.1, 1.4, 1, 1])
+    target_quarter = controls[0].text_input("Result quarter", value="Jun 2026", help="Use the quarter label shown by Screener.in, for example Jun 2026.")
+    ranking_metric = controls[1].radio(
+        "Rank by YoY growth",
+        ["Sales", "Operating Profit", "Net Profit", "EPS"],
+        horizontal=True,
+    )
+    run_quarterly = controls[2].button("Run / Resume Quarterly Scan", type="primary", use_container_width=True)
+    recover_quarterly = controls[3].button("Use Saved Quarterly Scan", use_container_width=True)
+
+    if run_quarterly:
+        quarterly_progress = make_progress("Scraping Screener.in quarterly results")
+        try:
+            st.session_state["quarterly_results"] = run_quarterly_results_screen(
+                csv_path,
+                target_period=target_quarter,
+                progress_callback=quarterly_progress,
+                output_dir=OUTPUT_DIR,
+            )
+            st.success("Quarterly-results scan complete.")
+        except Exception as exc:
+            st.error(f"Quarterly-results scan stopped before finalization: {exc}")
+            saved_preview = load_saved_quarterly_preview(target_quarter)
+            if not saved_preview["quarterly_all"].empty:
+                st.session_state["quarterly_results"] = saved_preview
+                st.warning("Loaded the latest saved quarterly checkpoint. Use Saved Quarterly Scan to finalize it.")
+
+    if recover_quarterly:
+        recover_saved_quarterly_results(target_quarter)
+
+    if "quarterly_results" not in st.session_state:
+        saved_preview = load_saved_quarterly_preview(target_quarter)
+        if not saved_preview["quarterly_all"].empty:
+            st.session_state["quarterly_results"] = saved_preview
+
+    quarterly_results = st.session_state.get("quarterly_results", {})
+    quarterly_all = quarterly_results.get("quarterly_all", pd.DataFrame())
+    ranked_quarterly = prepare_quarterly_results(
+        quarterly_all,
+        target_period=target_quarter,
+        ranking_metric=ranking_metric,
+        matching_only=True,
+    )
+    all_for_quarter = prepare_quarterly_results(
+        quarterly_all,
+        target_period=target_quarter,
+        ranking_metric=ranking_metric,
+        matching_only=False,
+    )
+
+    quarterly_metrics = st.columns(3)
+    quarterly_metrics[0].metric("Companies Scanned", f"{len(all_for_quarter):,}" if not all_for_quarter.empty else "0")
+    quarterly_metrics[1].metric("Reported Selected Quarter", f"{len(ranked_quarterly):,}" if not ranked_quarterly.empty else "0")
+    quarterly_metrics[2].metric("Current Ranking", f"{ranking_metric} YoY Growth")
+
+    quarterly_tabs = st.tabs(["Ranked Results", "All Quarterly Scan"])
+    with quarterly_tabs[0]:
+        if ranked_quarterly.empty:
+            st.info("Run the scan to find companies with the selected quarter, or load a saved scan for the same quarter.")
+        else:
+            st.dataframe(format_percent_columns(ranked_quarterly), use_container_width=True, hide_index=True)
+            show_download(
+                f"Download ranked by {ranking_metric} YoY growth",
+                ranked_quarterly,
+                f"quarterly_results_{target_quarter.replace(' ', '_')}_{ranking_metric.lower().replace(' ', '_')}_yoy.csv",
+            )
+    with quarterly_tabs[1]:
+        if all_for_quarter.empty:
+            st.info("No saved full-universe scan exists for this result quarter yet.")
+        else:
+            st.dataframe(format_percent_columns(all_for_quarter), use_container_width=True, hide_index=True)
+            show_download("Download all quarterly scan", all_for_quarter, f"quarterly_results_all_{target_quarter.replace(' ', '_')}.csv")
+            st.caption(
+                f"Partial checkpoints are written to {paths['quarterly_results_partial']}. "
+                "Run / Resume continues only a checkpoint for the selected result quarter."
+            )

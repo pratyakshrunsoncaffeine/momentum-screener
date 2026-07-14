@@ -25,6 +25,13 @@ HEADERS = {
 }
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 
+QUARTERLY_METRICS: dict[str, tuple[str, ...]] = {
+    "Sales": ("Sales", "Revenue", "Operating Revenue"),
+    "Operating Profit": ("Operating Profit", "Operating Profit Before Depreciation"),
+    "Net Profit": ("Net Profit", "Profit After Tax", "PAT"),
+    "EPS": ("EPS in Rs", "EPS"),
+}
+
 
 def screen_fundamentals(
     momentum_frame: pd.DataFrame,
@@ -115,6 +122,97 @@ def screen_dii_holdings(
         checkpoint_path=checkpoint_path,
         checkpoint_every=checkpoint_every,
     )
+
+
+def screen_quarterly_results(
+    universe: pd.DataFrame,
+    target_period: str,
+    sleep_seconds: float = 0.6,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    checkpoint_path: str | Path | None = None,
+    checkpoint_every: int = 10,
+) -> pd.DataFrame:
+    """Scrape a full universe and compare a requested quarterly result period."""
+    if universe.empty:
+        return universe.copy()
+
+    normalized_target = normalize_quarter_period(target_period)
+    if normalized_target is None:
+        raise ValueError("Quarter must use a format such as 'Jun 2026'.")
+
+    rows: list[dict[str, Any]] = []
+    completed_tickers: set[str] = set()
+    checkpoint = Path(checkpoint_path) if checkpoint_path else None
+    if checkpoint:
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        rows, completed_tickers = load_quarterly_results_checkpoint(checkpoint, normalized_target)
+
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    records = universe.to_dict("records")
+    total = len(records)
+
+    for index, item in enumerate(records, start=1):
+        symbol = str(item["Ticker"]).strip().upper()
+        if symbol in completed_tickers:
+            continue
+        if progress_callback:
+            progress_callback(
+                len(completed_tickers),
+                total,
+                f"Scraping quarterly results for {symbol} ({index:,}/{total:,})",
+            )
+        try:
+            metrics = fetch_company_quarterly_results(symbol, normalized_target, session=session)
+            note = "ok" if metrics["Target Quarter Found"] else "target quarter not reported"
+            row = {**item, **metrics, "Quarterly Results Scan Notes": note}
+        except Exception as exc:
+            row = quarterly_results_empty_row(symbol, normalized_target)
+            row.update(item)
+            row["Quarterly Results Scan Notes"] = f"Screener fetch failed: {exc}"
+
+        rows.append(row)
+        completed_tickers.add(symbol)
+        if checkpoint and (len(completed_tickers) == total or len(completed_tickers) % checkpoint_every == 0):
+            pd.DataFrame(rows).to_csv(checkpoint, index=False)
+        if progress_callback:
+            progress_callback(
+                len(completed_tickers),
+                total,
+                f"Completed {len(completed_tickers):,} of {total:,} quarterly-result scans",
+            )
+        time.sleep(sleep_seconds)
+
+    result = pd.DataFrame(rows)
+    if checkpoint:
+        result.to_csv(checkpoint, index=False)
+    return result
+
+
+def load_quarterly_results_checkpoint(
+    checkpoint: Path,
+    target_period: str,
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """Load a matching quarterly checkpoint and retry only failed network rows."""
+    if not checkpoint.exists() or checkpoint.stat().st_size == 0:
+        return [], set()
+    try:
+        frame = pd.read_csv(checkpoint)
+    except Exception:
+        return [], set()
+
+    required_columns = {"Ticker", "Target Quarter", "Quarterly Results Scan Notes"}
+    if frame.empty or not required_columns.issubset(frame.columns):
+        return [], set()
+    target_values = frame["Target Quarter"].map(normalize_quarter_period)
+    if target_values.dropna().empty or not target_values.dropna().eq(target_period).all():
+        return [], set()
+
+    frame = frame.drop_duplicates(subset=["Ticker"], keep="last")
+    retry_mask = frame["Quarterly Results Scan Notes"].astype(str).str.startswith("Screener fetch failed", na=False)
+    frame = frame[~retry_mask].copy()
+    tickers = set(frame["Ticker"].astype(str).str.strip().str.upper())
+    return frame.to_dict("records"), tickers
 
 
 def screen_institutional_holdings(
@@ -230,6 +328,24 @@ def fetch_company_fundamentals(
         "Annual Revenue Growth %": extract_annual_sales_growth(soup),
         "Promoter Holding Change %": extract_promoter_holding_change(soup),
     }
+
+
+def fetch_company_quarterly_results(
+    symbol: str,
+    target_period: str,
+    session: requests.Session | None = None,
+    timeout: int = 20,
+) -> dict[str, Any]:
+    """Return target-quarter, QoQ, and YoY values from a Screener quarterly table."""
+    normalized_target = normalize_quarter_period(target_period)
+    if normalized_target is None:
+        raise ValueError("Quarter must use a format such as 'Jun 2026'.")
+
+    session = session or requests.Session()
+    session.headers.update(HEADERS)
+    url, html = fetch_screener_html(symbol, session=session, timeout=timeout)
+    soup = BeautifulSoup(html, "lxml")
+    return extract_quarterly_results(soup, normalized_target, screener_url=url)
 
 
 def fetch_company_fii_holding(
@@ -389,6 +505,63 @@ def extract_quarterly_sales_growth(soup: BeautifulSoup) -> float | None:
     return trailing_growth(row, include_ttm=False)
 
 
+def quarterly_results_empty_row(symbol: str, target_period: str) -> dict[str, Any]:
+    """Create a stable output schema when a company page cannot be read."""
+    result: dict[str, Any] = {
+        "Screener URL": screener_company_url(symbol),
+        "Market Cap Cr": None,
+        "Target Quarter": target_period,
+        "Previous Quarter": previous_quarter_period(target_period),
+        "Year Ago Quarter": year_ago_quarter_period(target_period),
+        "Target Quarter Found": False,
+    }
+    for metric in QUARTERLY_METRICS:
+        result.update(
+            {
+                f"{metric} Current": None,
+                f"{metric} Previous Quarter": None,
+                f"{metric} Year Ago": None,
+                f"{metric} QoQ Growth %": None,
+                f"{metric} YoY Growth %": None,
+            }
+        )
+    return result
+
+
+def extract_quarterly_results(
+    soup: BeautifulSoup,
+    target_period: str,
+    screener_url: str | None = None,
+) -> dict[str, Any]:
+    """Extract four quarterly metrics for one selected result period."""
+    result = quarterly_results_empty_row("", target_period)
+    if screener_url:
+        result["Screener URL"] = screener_url
+    result["Market Cap Cr"] = extract_market_cap(soup)
+
+    table = section_table(soup, "quarters")
+    if table is None:
+        return result
+    available_periods = {normalize_quarter_period(column) for column in table.columns[1:]}
+    result["Target Quarter Found"] = target_period in available_periods
+    if not result["Target Quarter Found"]:
+        return result
+
+    previous_period = previous_quarter_period(target_period)
+    year_ago_period = year_ago_quarter_period(target_period)
+    for metric, labels in QUARTERLY_METRICS.items():
+        row = metric_row(table, labels)
+        current = value_for_period(row, target_period)
+        previous = value_for_period(row, previous_period)
+        year_ago = value_for_period(row, year_ago_period)
+        result[f"{metric} Current"] = current
+        result[f"{metric} Previous Quarter"] = previous
+        result[f"{metric} Year Ago"] = year_ago
+        result[f"{metric} QoQ Growth %"] = percentage_growth(current, previous)
+        result[f"{metric} YoY Growth %"] = percentage_growth(current, year_ago)
+    return result
+
+
 def extract_annual_sales_growth(soup: BeautifulSoup) -> float | None:
     table = section_table(soup, "profit-loss")
     if table is None:
@@ -519,6 +692,65 @@ def numeric_values_with_periods(row: pd.Series | None, include_ttm: bool) -> lis
         if parsed is not None:
             values.append((period, parsed))
     return values
+
+
+def value_for_period(row: pd.Series | None, target_period: str | None) -> float | None:
+    """Look up a quarterly cell by its normalized period header."""
+    if row is None or target_period is None:
+        return None
+    for column, value in row.iloc[1:].items():
+        if normalize_quarter_period(column) == target_period:
+            return parse_number(value)
+    return None
+
+
+def percentage_growth(current: float | None, comparison: float | None) -> float | None:
+    if current is None or comparison is None or comparison == 0:
+        return None
+    return round(((current / comparison) - 1.0) * 100.0, 2)
+
+
+def normalize_quarter_period(value: object) -> str | None:
+    """Normalize Screener labels such as 'Jun 2026' to 'JUN 2026'."""
+    text = re.sub(r"\s+", " ", str(value).strip())
+    match = re.fullmatch(r"([A-Za-z]{3,9})[\s-]+(\d{4})", text)
+    if not match:
+        return None
+    month_token, year = match.groups()
+    month_lookup = {
+        "JAN": 1, "JANUARY": 1,
+        "FEB": 2, "FEBRUARY": 2,
+        "MAR": 3, "MARCH": 3,
+        "APR": 4, "APRIL": 4,
+        "MAY": 5,
+        "JUN": 6, "JUNE": 6,
+        "JUL": 7, "JULY": 7,
+        "AUG": 8, "AUGUST": 8,
+        "SEP": 9, "SEPT": 9, "SEPTEMBER": 9,
+        "OCT": 10, "OCTOBER": 10,
+        "NOV": 11, "NOVEMBER": 11,
+        "DEC": 12, "DECEMBER": 12,
+    }
+    month = month_lookup.get(month_token.upper())
+    if month is None:
+        return None
+    return f"{pd.Timestamp(year=int(year), month=month, day=1).strftime('%b').upper()} {year}"
+
+
+def previous_quarter_period(target_period: str) -> str | None:
+    normalized = normalize_quarter_period(target_period)
+    if normalized is None:
+        return None
+    date = pd.to_datetime(normalized.title(), format="%b %Y") - pd.DateOffset(months=3)
+    return f"{date.strftime('%b').upper()} {date.year}"
+
+
+def year_ago_quarter_period(target_period: str) -> str | None:
+    normalized = normalize_quarter_period(target_period)
+    if normalized is None:
+        return None
+    date = pd.to_datetime(normalized.title(), format="%b %Y") - pd.DateOffset(years=1)
+    return f"{date.strftime('%b').upper()} {date.year}"
 
 
 def clean_label(value: object) -> str:

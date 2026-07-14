@@ -8,7 +8,13 @@ import yfinance as yf
 
 from .backtest import current_allocation, performance_summary, walk_forward_backtest
 from .config import ScreeningConfig
-from .fundamentals import screen_dii_holdings, screen_fii_holdings, screen_fundamentals
+from .fundamentals import (
+    normalize_quarter_period,
+    screen_dii_holdings,
+    screen_fii_holdings,
+    screen_fundamentals,
+    screen_quarterly_results,
+)
 from .momentum import calculate_returns, download_adjusted_close, score_momentum
 from .universe import load_ticker_universe
 
@@ -43,6 +49,9 @@ def output_paths(output_dir: str | Path = "output/latest") -> dict[str, Path]:
         "dii_top": root / "dii_top50.csv",
         "dii_momentum": root / "dii_momentum.csv",
         "dii_final": root / "dii_final.csv",
+        "quarterly_results_partial": root / "quarterly_results_partial.csv",
+        "quarterly_results_all": root / "quarterly_results_all.csv",
+        "quarterly_results_matching": root / "quarterly_results_matching.csv",
     }
 
 
@@ -181,6 +190,68 @@ def run_dii_momentum_screen(
         price_progress_callback=price_progress_callback,
         output_dir=output_dir,
     )
+
+
+def run_quarterly_results_screen(
+    csv_path: str,
+    target_period: str,
+    progress_callback: ProgressCallback | None = None,
+    output_dir: str | Path = "output/latest",
+) -> dict[str, pd.DataFrame]:
+    """Scan the full ticker universe for one quarterly result period."""
+    normalized_target = normalize_quarter_period(target_period)
+    if normalized_target is None:
+        raise ValueError("Result quarter must use a format such as 'Jun 2026'.")
+    paths = output_paths(output_dir)
+    universe = load_ticker_universe(csv_path)
+    all_results = screen_quarterly_results(
+        universe,
+        normalized_target,
+        progress_callback=progress_callback,
+        checkpoint_path=paths["quarterly_results_partial"],
+    )
+    return finalize_quarterly_results_screen(all_results, normalized_target, output_dir=output_dir)
+
+
+def finalize_quarterly_results_screen(
+    all_results: pd.DataFrame,
+    target_period: str,
+    output_dir: str | Path = "output/latest",
+) -> dict[str, pd.DataFrame]:
+    """Persist a full quarterly scan plus its target-quarter subset."""
+    normalized_target = normalize_quarter_period(target_period)
+    if normalized_target is None:
+        raise ValueError("Result quarter must use a format such as 'Jun 2026'.")
+    paths = output_paths(output_dir)
+    all_prepared = prepare_quarterly_results(all_results, target_period=normalized_target, matching_only=False)
+    matching = prepare_quarterly_results(all_results, target_period=normalized_target, matching_only=True)
+    save_frame(all_prepared, paths["quarterly_results_all"])
+    save_frame(matching, paths["quarterly_results_matching"])
+    return {"quarterly_all": all_prepared, "quarterly_matching": matching}
+
+
+def prepare_quarterly_results(
+    frame: pd.DataFrame,
+    target_period: str | None = None,
+    ranking_metric: str = "Sales",
+    matching_only: bool = True,
+) -> pd.DataFrame:
+    """Filter a saved quarterly scan to one result period and sort by YoY growth."""
+    result = frame.copy()
+    if result.empty:
+        return result
+    if "Target Quarter" in result.columns and target_period:
+        normalized_target = normalize_quarter_period(target_period)
+        result = result[result["Target Quarter"].map(normalize_quarter_period).eq(normalized_target)].copy()
+    if "Target Quarter Found" in result.columns and matching_only:
+        found = result["Target Quarter Found"].astype(str).str.strip().str.lower().isin({"true", "1", "yes"})
+        result = result[found].copy()
+
+    ranking_column = f"{ranking_metric} YoY Growth %"
+    if ranking_column in result.columns:
+        result[ranking_column] = pd.to_numeric(result[ranking_column], errors="coerce")
+        result = result.sort_values(ranking_column, ascending=False, na_position="last")
+    return result.reset_index(drop=True)
 
 
 def prepare_fii_all(frame: pd.DataFrame) -> pd.DataFrame:
