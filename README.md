@@ -9,6 +9,8 @@ This project screens NSE stocks from `ticker.csv` in four stages:
 
 The dashboard also backtests a portfolio invested in the top 10 final companies: 70% split across the top 5 and 30% split across the next 5, compared against Nifty 50 and a Nifty Midcap benchmark where Yahoo Finance data is available.
 
+It also includes independent FII, DII, quarterly-results, post-earnings stock-return, and NSE derivatives momentum workflows. Each long-running scanner writes checkpoints so a Streamlit refresh does not discard completed work.
+
 The portfolio tab uses a monthly walk-forward price backtest. Each month it recalculates momentum using only price data available before that rebalance date, invests for one month, then reinvests the ending capital into the next month's selected portfolio. If fundamentals are applied, the historical backtest uses the current fundamentals-passed universe as a static filter, so it avoids price lookahead but still has current-fundamentals bias.
 
 ## Dashboard Flow
@@ -87,6 +89,43 @@ The default weights are 20% for 2 days, 30% for 5 days, and 50% for 10 days. The
 - `output/latest/quarterly_stock_return_returns.csv`
 - `output/latest/quarterly_stock_return_momentum.csv`
 
+## Derivatives Momentum Scanner
+
+The `Derivatives Momentum` tab uses official end-of-day NSE cash-market, F&O bhavcopy, and F&O contract reports. It intersects each date's stock F&O universe with all tickers in `ticker.csv`; companies without listed derivatives are retained in the export with `No listed derivatives` status.
+
+A default options-confirmed equity signal requires all of the following on the same trading day:
+
+- Underlying stock return of at least 2%.
+- Selected near-ATM call return of at least 8%. The 8% threshold is a hard minimum; larger gains remain eligible and rank higher.
+- Call close of at least Rs. 5.
+- Call volume and open interest of at least 100 contracts each.
+- A monthly stock-option expiry between 7 and 45 calendar days away.
+- Valid current and previous closes with no detected corporate-action distortion.
+
+The signal recommends buying the underlying equity, not the call. Qualifying stocks are ranked by call return, stock return, call OI change, call volume versus its 20-day median, and near-month futures return. Rising call OI is a ranking input rather than a hard bullish rule because it can represent buying or writing. Futures activity is separately labelled as long build-up, short covering, short build-up, long unwinding, or unconfirmed.
+
+Use the tab in this order:
+
+1. Select a date range and click `Download / Resume EOD Data`. Raw reports and normalized daily CSVs are cached by trade date.
+2. Choose a cached signal date and click `Run Options-Confirmed Momentum`.
+3. Review ranked signals, rejection reasons, the complete F&O eligibility map, and report health.
+4. For validation, first backfill the historical range, then run the chronological event study and portfolio simulation.
+
+The backtest enters the stock at the next trading day's open, measures 1, 3, 5, and 10-day forward returns, deducts the configured round-trip cost, and compares stock-only, stock-plus-call, full derivatives, regular momentum, and Nifty 50 results. Events are split chronologically into 60% Train, 20% Validation, and 20% untouched Test periods. A useful strategy should improve the full derivatives Test result over the stock-only baseline after costs, not merely look attractive in training.
+
+Saved derivatives files:
+
+- `output/derivatives_cache/` for raw and normalized daily NSE reports.
+- `output/latest/derivatives_contracts.csv`
+- `output/latest/derivatives_daily_features.csv`
+- `output/latest/derivatives_signals.csv`
+- `output/latest/derivatives_rejections.csv`
+- `output/latest/derivatives_data_health.csv`
+- `output/latest/derivatives_backtest_events.csv`
+- `output/latest/derivatives_backtest_curve.csv`
+- `output/latest/derivatives_backtest_summary.csv`
+- `output/latest/derivatives_event_summary.csv`
+
 ## Local Setup
 
 ```powershell
@@ -108,6 +147,7 @@ Most screener knobs are in `screener_momentum/config.py`:
 - `DEFAULT_MOMENTUM_WEIGHTS`
 - `DEFAULT_POSITIVE_RETURN_FILTERS`
 - `FundamentalThresholds`
+- `DerivativesSignalConfig`
 - `BENCHMARKS`
 
 The Streamlit sidebar also lets you adjust weights and filter thresholds without code edits.
