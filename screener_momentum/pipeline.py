@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from datetime import date, timedelta
 
 import pandas as pd
 import yfinance as yf
@@ -11,7 +12,10 @@ from .config import (
     DEFAULT_POST_EARNINGS_STOCK_RETURN_WEIGHTS,
     POST_EARNINGS_STOCK_RETURN_PERIODS,
     ScreeningConfig,
+    DerivativesSignalConfig,
 )
+from .derivatives import NseEodDerivativesProvider, build_volume_history, scan_derivatives_momentum
+from .derivatives_backtest import derivatives_backtest, summarize_derivatives_curve, summarize_derivatives_events
 from .fundamentals import (
     normalize_quarter_period,
     screen_dii_holdings,
@@ -58,12 +62,107 @@ def output_paths(output_dir: str | Path = "output/latest") -> dict[str, Path]:
         "quarterly_results_matching": root / "quarterly_results_matching.csv",
         "quarterly_stock_return_returns": root / "quarterly_stock_return_returns.csv",
         "quarterly_stock_return_momentum": root / "quarterly_stock_return_momentum.csv",
+        "derivatives_cache": root.parent / "derivatives_cache",
+        "derivatives_contracts": root / "derivatives_contracts.csv",
+        "derivatives_daily_features": root / "derivatives_daily_features.csv",
+        "derivatives_signals": root / "derivatives_signals.csv",
+        "derivatives_rejections": root / "derivatives_rejections.csv",
+        "derivatives_data_health": root / "derivatives_data_health.csv",
+        "derivatives_backtest_events": root / "derivatives_backtest_events.csv",
+        "derivatives_backtest_curve": root / "derivatives_backtest_curve.csv",
+        "derivatives_backtest_summary": root / "derivatives_backtest_summary.csv",
+        "derivatives_event_summary": root / "derivatives_event_summary.csv",
     }
 
 
 def save_frame(frame: pd.DataFrame, path: Path, include_index: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(path, index=include_index)
+
+
+def _read_saved_frame(path: Path) -> pd.DataFrame:
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
+
+def _download_nifty_prices(start_date: date, end_date: date) -> pd.DataFrame:
+    try:
+        data = yf.download(
+            "^NSEI",
+            start=start_date.isoformat(),
+            end=(end_date + timedelta(days=1)).isoformat(),
+            auto_adjust=True,
+            progress=False,
+        )
+        if data.empty:
+            return pd.DataFrame()
+        if isinstance(data.columns, pd.MultiIndex):
+            data = data.xs("^NSEI", axis=1, level=1) if "^NSEI" in data.columns.get_level_values(1) else data.droplevel(1, axis=1)
+        result = data.reset_index()
+        result["Date"] = pd.to_datetime(result["Date"], errors="coerce").dt.date
+        return result.dropna(subset=["Date"]).set_index("Date")
+    except Exception:
+        return pd.DataFrame()
+
+
+def _add_nifty_benchmark(
+    curve: pd.DataFrame,
+    start_date: date,
+    end_date: date,
+    prices: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    if curve.empty:
+        return curve
+    try:
+        data = prices if prices is not None else _download_nifty_prices(start_date, end_date)
+        if data.empty:
+            return curve
+        close = data["Close"]
+        close = pd.to_numeric(close, errors="coerce").dropna()
+        if close.empty:
+            return curve
+        initial = float(pd.to_numeric(curve["Portfolio Value"], errors="coerce").dropna().iloc[0])
+        benchmark = pd.DataFrame(
+            {
+                "Date": list(close.index),
+                "Variant": "Nifty 50",
+                "Portfolio Value": (close / close.iloc[0] * initial).round(2).to_numpy(),
+            }
+        )
+        return pd.concat([curve, benchmark], ignore_index=True)
+    except Exception:
+        return curve
+
+
+def _add_nifty_event_returns(events: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
+    result = events.copy()
+    if result.empty or prices.empty or not {"Open", "Close"}.issubset(prices.columns):
+        return result
+    opens = pd.to_numeric(prices["Open"], errors="coerce")
+    closes = pd.to_numeric(prices["Close"], errors="coerce")
+    benchmark_returns: list[float | None] = []
+    for row in result.to_dict("records"):
+        entry_date = pd.to_datetime(row["Entry Date"], errors="coerce")
+        exit_date = pd.to_datetime(row["Exit Date"], errors="coerce")
+        if pd.isna(entry_date) or pd.isna(exit_date):
+            benchmark_returns.append(None)
+            continue
+        entry = opens.get(entry_date.date())
+        exit_value = closes.get(exit_date.date())
+        if pd.isna(entry) or pd.isna(exit_value) or float(entry) <= 0:
+            benchmark_returns.append(None)
+        else:
+            benchmark_returns.append(round((float(exit_value) / float(entry) - 1.0) * 100.0, 3))
+    result["Nifty 50 Return %"] = benchmark_returns
+    result["Excess Return vs Nifty 50 %"] = (
+        pd.to_numeric(result["Net Return %"], errors="coerce")
+        - pd.to_numeric(result["Nifty 50 Return %"], errors="coerce")
+    ).round(3)
+    return result
 
 
 def load_saved_returns(output_dir: str | Path = "output/latest") -> pd.DataFrame:
@@ -118,6 +217,130 @@ def run_momentum(
         output_dir=output_dir,
     )
     return score_and_save_momentum(returns, config, output_dir=output_dir)
+
+
+def download_derivatives_eod_data(
+    start_date: date,
+    end_date: date,
+    progress_callback: ProgressCallback | None = None,
+    output_dir: str | Path = "output/latest",
+) -> pd.DataFrame:
+    paths = output_paths(output_dir)
+    provider = NseEodDerivativesProvider(paths["derivatives_cache"])
+    health = provider.download_range(start_date, end_date, progress_callback=progress_callback)
+    save_frame(health, paths["derivatives_data_health"])
+    return health
+
+
+def run_derivatives_momentum_screen(
+    csv_path: str,
+    config: DerivativesSignalConfig,
+    scan_date: date | None = None,
+    progress_callback: ProgressCallback | None = None,
+    output_dir: str | Path = "output/latest",
+) -> dict[str, pd.DataFrame]:
+    paths = output_paths(output_dir)
+    provider = NseEodDerivativesProvider(paths["derivatives_cache"])
+    available = [item for item in provider.available_dates() if scan_date is None or item <= scan_date]
+    if not available:
+        raise FileNotFoundError("No cached NSE derivatives dates are available. Download EOD data first.")
+    selected_date = max(available)
+    selected_index = available.index(selected_date)
+    daily = provider.load_date(selected_date)
+    previous = provider.load_date(available[selected_index - 1]).derivatives if selected_index > 0 else None
+    universe = load_ticker_universe(csv_path)
+
+    prior_frames: list[pd.DataFrame] = []
+    history_dates = available[max(0, selected_index - 20):selected_index]
+    for index, history_date in enumerate(history_dates, start=1):
+        if progress_callback:
+            progress_callback(index - 1, len(history_dates) + 1, f"Building option-volume history for {history_date}")
+        history_daily = provider.load_date(history_date)
+        history_previous = (
+            provider.load_date(available[available.index(history_date) - 1]).derivatives
+            if available.index(history_date) > 0
+            else None
+        )
+        history_scan = scan_derivatives_momentum(
+            universe,
+            history_daily,
+            config,
+            previous_derivatives=history_previous,
+            volume_history=build_volume_history(prior_frames[-20:]),
+        )
+        prior_frames.append(history_scan["features"])
+
+    results = scan_derivatives_momentum(
+        universe,
+        daily,
+        config,
+        previous_derivatives=previous,
+        volume_history=build_volume_history(prior_frames[-20:]),
+        progress_callback=progress_callback,
+    )
+    save_frame(results["contracts"], paths["derivatives_contracts"])
+    save_frame(results["features"], paths["derivatives_daily_features"])
+    save_frame(results["signals"], paths["derivatives_signals"])
+    save_frame(results["rejections"], paths["derivatives_rejections"])
+    results["data_health"] = _read_saved_frame(paths["derivatives_data_health"])
+    return results
+
+
+def run_derivatives_backtest_screen(
+    csv_path: str,
+    config: DerivativesSignalConfig,
+    start_date: date,
+    end_date: date,
+    holding_days: int = 5,
+    top_n: int = 10,
+    round_trip_cost_pct: float = 0.30,
+    progress_callback: ProgressCallback | None = None,
+    output_dir: str | Path = "output/latest",
+) -> dict[str, pd.DataFrame]:
+    paths = output_paths(output_dir)
+    provider = NseEodDerivativesProvider(paths["derivatives_cache"])
+    universe = load_ticker_universe(csv_path)
+    result = derivatives_backtest(
+        provider,
+        universe,
+        config,
+        start_date,
+        end_date,
+        holding_days=holding_days,
+        top_n=top_n,
+        round_trip_cost_pct=round_trip_cost_pct,
+        progress_callback=progress_callback,
+    )
+    nifty_prices = _download_nifty_prices(start_date, end_date)
+    events = _add_nifty_event_returns(result.events, nifty_prices)
+    curve = _add_nifty_benchmark(result.curve, start_date, end_date, prices=nifty_prices)
+    performance = summarize_derivatives_curve(curve, events)
+    event_summary = summarize_derivatives_events(events)
+    save_frame(events, paths["derivatives_backtest_events"])
+    save_frame(curve, paths["derivatives_backtest_curve"])
+    save_frame(performance, paths["derivatives_backtest_summary"])
+    save_frame(event_summary, paths["derivatives_event_summary"])
+    return {
+        "events": events,
+        "curve": curve,
+        "performance": performance,
+        "event_summary": event_summary,
+    }
+
+
+def load_saved_derivatives_results(output_dir: str | Path = "output/latest") -> dict[str, pd.DataFrame]:
+    paths = output_paths(output_dir)
+    return {
+        "contracts": _read_saved_frame(paths["derivatives_contracts"]),
+        "features": _read_saved_frame(paths["derivatives_daily_features"]),
+        "signals": _read_saved_frame(paths["derivatives_signals"]),
+        "rejections": _read_saved_frame(paths["derivatives_rejections"]),
+        "data_health": _read_saved_frame(paths["derivatives_data_health"]),
+        "events": _read_saved_frame(paths["derivatives_backtest_events"]),
+        "curve": _read_saved_frame(paths["derivatives_backtest_curve"]),
+        "performance": _read_saved_frame(paths["derivatives_backtest_summary"]),
+        "event_summary": _read_saved_frame(paths["derivatives_event_summary"]),
+    }
 
 
 def run_fii_momentum_screen(
