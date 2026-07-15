@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -12,19 +13,24 @@ from screener_momentum.config import (
     DEFAULT_POST_EARNINGS_STOCK_RETURN_WEIGHTS,
     DEFAULT_MOMENTUM_WEIGHTS,
     DEFAULT_POSITIVE_RETURN_FILTERS,
+    DerivativesSignalConfig,
     FundamentalThresholds,
     ScreeningConfig,
 )
 from screener_momentum.pipeline import (
+    download_derivatives_eod_data,
     finalize_dii_momentum_screen,
     finalize_fii_momentum_screen,
     finalize_quarterly_results_screen,
     load_saved_returns,
+    load_saved_derivatives_results,
     output_paths,
     prepare_dii_all,
     prepare_fii_all,
     prepare_quarterly_results,
     run_dii_momentum_screen,
+    run_derivatives_backtest_screen,
+    run_derivatives_momentum_screen,
     run_fii_momentum_screen,
     run_fundamentals_screen,
     run_quarterly_results_screen,
@@ -164,7 +170,12 @@ def load_saved_run(config: ScreeningConfig) -> None:
 
 
 def read_csv_if_exists(path: Path, **kwargs) -> pd.DataFrame:
-    return pd.read_csv(path, **kwargs) if path.exists() and path.stat().st_size > 0 else pd.DataFrame()
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path, **kwargs)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
 
 
 def recover_saved_results(config: ScreeningConfig) -> None:
@@ -464,6 +475,7 @@ tabs = st.tabs(
         "FII Accumulation",
         "DII Accumulation",
         "Quarterly Results",
+        "Derivatives Momentum",
     ]
 )
 
@@ -889,3 +901,317 @@ with tabs[6]:
                 f"Saved price returns: {paths['quarterly_stock_return_returns']}. "
                 f"Saved ranking: {paths['quarterly_stock_return_momentum']}."
             )
+
+with tabs[7]:
+    st.subheader("Options-Confirmed Equity Momentum")
+    st.caption(
+        "End-of-day continuation signals from official NSE cash and derivatives reports. A signal requires "
+        "the stock to rise on the signal day and its selected near-ATM call to gain at least 8%. The result "
+        "is an equity-buying signal; it is not a recommendation to buy the option."
+    )
+
+    st.markdown("**1. Download Or Resume NSE EOD Data**")
+    default_derivatives_end = date.today() - timedelta(days=1)
+    download_controls = st.columns([1, 1, 1.25, 1])
+    derivatives_start = download_controls[0].date_input(
+        "Download start",
+        value=default_derivatives_end - timedelta(days=45),
+        key="derivatives_download_start",
+    )
+    derivatives_end = download_controls[1].date_input(
+        "Download end",
+        value=default_derivatives_end,
+        max_value=default_derivatives_end,
+        key="derivatives_download_end",
+    )
+    download_derivatives = download_controls[2].button(
+        "Download / Resume EOD Data",
+        type="primary",
+        use_container_width=True,
+    )
+    recover_derivatives = download_controls[3].button(
+        "Use Saved Derivatives Run",
+        use_container_width=True,
+    )
+
+    if download_derivatives:
+        if derivatives_start > derivatives_end:
+            st.error("Download start must be on or before download end.")
+        else:
+            derivatives_download_progress = make_progress("Downloading official NSE reports by date")
+            try:
+                health = download_derivatives_eod_data(
+                    derivatives_start,
+                    derivatives_end,
+                    progress_callback=derivatives_download_progress,
+                    output_dir=OUTPUT_DIR,
+                )
+                saved = st.session_state.get("derivatives_results", load_saved_derivatives_results(OUTPUT_DIR))
+                saved["data_health"] = health
+                st.session_state["derivatives_results"] = saved
+                completed_dates = int(
+                    health.get("Status", pd.Series(dtype=str)).astype(str).str.lower().isin(["downloaded", "cached"]).sum()
+                )
+                st.success(f"NSE EOD cache updated. {completed_dates:,} requested dates are available.")
+            except Exception as exc:
+                st.error(f"NSE EOD download stopped: {exc}. Completed dates remain cached and can be resumed.")
+
+    if recover_derivatives:
+        st.session_state["derivatives_results"] = load_saved_derivatives_results(OUTPUT_DIR)
+        st.success("Recovered the latest saved derivatives scan and backtest files.")
+
+    st.markdown("**2. Signal Rules And Ranking**")
+    rule_controls = st.columns(5)
+    derivative_signal_date = rule_controls[0].date_input(
+        "Signal date",
+        value=default_derivatives_end,
+        max_value=default_derivatives_end,
+        key="derivatives_signal_date",
+    )
+    min_stock_return = rule_controls[1].number_input(
+        "Minimum stock return %",
+        min_value=0.01,
+        max_value=25.0,
+        value=2.0,
+        step=0.25,
+        help="The stock must close up by at least this amount on the same day.",
+    )
+    min_call_return = rule_controls[2].number_input(
+        "Minimum call return %",
+        min_value=8.0,
+        max_value=500.0,
+        value=8.0,
+        step=1.0,
+        help="8% is the hard minimum. Larger call gains remain eligible and rank higher.",
+    )
+    min_call_price = rule_controls[3].number_input(
+        "Minimum call close Rs.",
+        min_value=0.0,
+        max_value=10000.0,
+        value=5.0,
+        step=1.0,
+    )
+    derivative_result_count = rule_controls[4].number_input(
+        "Maximum signals",
+        min_value=1,
+        max_value=500,
+        value=100,
+        step=10,
+    )
+
+    liquidity_controls = st.columns(4)
+    min_option_volume = liquidity_controls[0].number_input(
+        "Minimum call volume (contracts)",
+        min_value=0,
+        max_value=1000000,
+        value=100,
+        step=50,
+    )
+    min_option_oi = liquidity_controls[1].number_input(
+        "Minimum call OI (contracts)",
+        min_value=0,
+        max_value=1000000,
+        value=100,
+        step=50,
+    )
+    min_dte = liquidity_controls[2].number_input(
+        "Minimum days to expiry",
+        min_value=1,
+        max_value=60,
+        value=7,
+        step=1,
+    )
+    max_dte = liquidity_controls[3].number_input(
+        "Maximum days to expiry",
+        min_value=2,
+        max_value=90,
+        value=45,
+        step=1,
+    )
+
+    with st.expander("Ranking weights", expanded=False):
+        weight_controls = st.columns(5)
+        call_return_weight = weight_controls[0].number_input("Call return % weight", 0.0, 100.0, 35.0, 5.0)
+        stock_return_weight = weight_controls[1].number_input("Stock return % weight", 0.0, 100.0, 25.0, 5.0)
+        call_oi_weight = weight_controls[2].number_input("Call OI change weight", 0.0, 100.0, 15.0, 5.0)
+        volume_ratio_weight = weight_controls[3].number_input("Volume ratio weight", 0.0, 100.0, 15.0, 5.0)
+        futures_return_weight = weight_controls[4].number_input("Futures return weight", 0.0, 100.0, 10.0, 5.0)
+
+    total_derivative_weight = sum(
+        [call_return_weight, stock_return_weight, call_oi_weight, volume_ratio_weight, futures_return_weight]
+    )
+    settings_valid = max_dte >= min_dte and abs(total_derivative_weight - 100.0) < 0.001
+    if max_dte < min_dte:
+        st.error("Maximum days to expiry must be greater than or equal to the minimum.")
+    if abs(total_derivative_weight - 100.0) >= 0.001:
+        st.error(f"Ranking weights must total 100%. Current total: {total_derivative_weight:.1f}%.")
+
+    derivatives_config = DerivativesSignalConfig(
+        min_underlying_return_pct=float(min_stock_return),
+        min_call_return_pct=float(min_call_return),
+        min_call_price=float(min_call_price),
+        min_volume_contracts=int(min_option_volume),
+        min_open_interest_contracts=int(min_option_oi),
+        min_days_to_expiry=int(min_dte),
+        max_days_to_expiry=int(max_dte),
+        result_count=int(derivative_result_count),
+        call_return_weight=float(call_return_weight) / 100.0,
+        underlying_return_weight=float(stock_return_weight) / 100.0,
+        call_oi_change_weight=float(call_oi_weight) / 100.0,
+        call_volume_ratio_weight=float(volume_ratio_weight) / 100.0,
+        futures_return_weight=float(futures_return_weight) / 100.0,
+    )
+    run_derivatives_signal = st.button(
+        "Run Options-Confirmed Momentum",
+        type="primary",
+        disabled=not settings_valid,
+    )
+    if run_derivatives_signal:
+        derivatives_scan_progress = make_progress("Building history, then checking every ticker")
+        try:
+            scan_results = run_derivatives_momentum_screen(
+                csv_path,
+                derivatives_config,
+                scan_date=derivative_signal_date,
+                progress_callback=derivatives_scan_progress,
+                output_dir=OUTPUT_DIR,
+            )
+            existing = st.session_state.get("derivatives_results", load_saved_derivatives_results(OUTPUT_DIR))
+            existing.update(scan_results)
+            st.session_state["derivatives_results"] = existing
+            signal_count = len(scan_results["signals"])
+            st.success(f"Derivatives scan complete: {signal_count:,} stocks passed every signal and liquidity rule.")
+        except Exception as exc:
+            st.error(f"Derivatives signal scan could not finish: {exc}")
+
+    st.markdown("**3. Strategy Validation**")
+    st.caption(
+        "Signals enter the underlying equity at the next trading day's open. The event study compares the "
+        "stock-only, stock-plus-call, full derivatives, and regular momentum variants after costs."
+    )
+    backtest_controls = st.columns(6)
+    derivative_backtest_start = backtest_controls[0].date_input(
+        "Backtest start",
+        value=default_derivatives_end - timedelta(days=365 * 3),
+        key="derivatives_backtest_start",
+    )
+    derivative_backtest_end = backtest_controls[1].date_input(
+        "Backtest end",
+        value=default_derivatives_end,
+        max_value=default_derivatives_end,
+        key="derivatives_backtest_end",
+    )
+    derivative_holding_days = backtest_controls[2].number_input("Holding days", 1, 20, 5, 1)
+    derivative_top_n = backtest_controls[3].number_input("Top concurrent positions", 1, 50, 10, 1)
+    derivative_cost = backtest_controls[4].number_input("Round-trip cost %", 0.0, 5.0, 0.30, 0.05)
+    run_derivatives_backtest = backtest_controls[5].button(
+        "Run Backtest",
+        type="primary",
+        use_container_width=True,
+        disabled=not settings_valid,
+    )
+    if run_derivatives_backtest:
+        if derivative_backtest_start >= derivative_backtest_end:
+            st.error("Backtest start must be before backtest end.")
+        else:
+            derivatives_backtest_progress = make_progress("Walking forward through cached trading dates")
+            try:
+                backtest_results = run_derivatives_backtest_screen(
+                    csv_path,
+                    derivatives_config,
+                    derivative_backtest_start,
+                    derivative_backtest_end,
+                    holding_days=int(derivative_holding_days),
+                    top_n=int(derivative_top_n),
+                    round_trip_cost_pct=float(derivative_cost),
+                    progress_callback=derivatives_backtest_progress,
+                    output_dir=OUTPUT_DIR,
+                )
+                existing = st.session_state.get("derivatives_results", load_saved_derivatives_results(OUTPUT_DIR))
+                existing.update(backtest_results)
+                st.session_state["derivatives_results"] = existing
+                st.success("Chronological derivatives event study and portfolio simulation are ready.")
+            except Exception as exc:
+                st.error(f"Backtest could not finish: {exc}")
+                st.info("Download or resume the selected backtest date range first. At least 12 cached trading dates are required.")
+
+    if "derivatives_results" not in st.session_state:
+        saved_derivatives = load_saved_derivatives_results(OUTPUT_DIR)
+        if any(not frame.empty for frame in saved_derivatives.values()):
+            st.session_state["derivatives_results"] = saved_derivatives
+
+    derivatives_results = st.session_state.get("derivatives_results", {})
+    derivative_signals = derivatives_results.get("signals", pd.DataFrame())
+    derivative_features = derivatives_results.get("features", pd.DataFrame())
+    derivative_rejections = derivatives_results.get("rejections", pd.DataFrame())
+    derivative_contracts = derivatives_results.get("contracts", pd.DataFrame())
+    derivative_health = derivatives_results.get("data_health", pd.DataFrame())
+    derivative_events = derivatives_results.get("events", pd.DataFrame())
+    derivative_curve = derivatives_results.get("curve", pd.DataFrame())
+    derivative_performance = derivatives_results.get("performance", pd.DataFrame())
+    derivative_event_summary = derivatives_results.get("event_summary", pd.DataFrame())
+
+    derivative_metrics = st.columns(4)
+    eligible_count = int(
+        derivative_contracts.get("Listed Derivatives", pd.Series(dtype=bool)).astype(str).str.lower().isin(["true", "1"]).sum()
+    ) if not derivative_contracts.empty else 0
+    derivative_metrics[0].metric("Ticker Universe", f"{len(derivative_contracts):,}")
+    derivative_metrics[1].metric("Listed Stock F&O", f"{eligible_count:,}")
+    derivative_metrics[2].metric("F&O Features Checked", f"{len(derivative_features):,}")
+    derivative_metrics[3].metric("Qualified Signals", f"{len(derivative_signals):,}")
+
+    derivative_tabs = st.tabs(["Ranked Signals", "Rejected Candidates", "F&O Universe", "Data Health", "Backtest"])
+    with derivative_tabs[0]:
+        if derivative_signals.empty:
+            st.info("No saved qualifying signals yet, or no stock passed every rule on the selected date.")
+        else:
+            st.dataframe(format_percent_columns(derivative_signals), use_container_width=True, hide_index=True)
+            show_download("Download derivatives signals", derivative_signals, "derivatives_signals.csv")
+    with derivative_tabs[1]:
+        if derivative_rejections.empty:
+            st.info("Run a derivatives signal scan to inspect rejection reasons.")
+        else:
+            st.dataframe(format_percent_columns(derivative_rejections), use_container_width=True, hide_index=True)
+            show_download("Download rejected candidates", derivative_rejections, "derivatives_rejections.csv")
+    with derivative_tabs[2]:
+        if derivative_contracts.empty:
+            st.info("Run a derivatives signal scan to map the full ticker universe to NSE stock F&O eligibility.")
+        else:
+            st.dataframe(derivative_contracts, use_container_width=True, hide_index=True)
+            show_download("Download F&O universe", derivative_contracts, "derivatives_contracts.csv")
+    with derivative_tabs[3]:
+        if derivative_health.empty:
+            st.info("Download an NSE EOD date range to see cached, completed, and unavailable report dates.")
+        else:
+            st.dataframe(derivative_health, use_container_width=True, hide_index=True)
+            show_download("Download data health", derivative_health, "derivatives_data_health.csv")
+            st.caption(f"Raw and normalized reports are checkpointed under {paths['derivatives_cache']}.")
+    with derivative_tabs[4]:
+        if derivative_curve.empty:
+            st.info("Download a historical EOD range and run the derivatives backtest to see strategy validation.")
+        else:
+            chart_frame = derivative_curve.copy()
+            chart_frame["Date"] = pd.to_datetime(chart_frame["Date"], errors="coerce")
+            chart = px.line(
+                chart_frame.dropna(subset=["Date"]),
+                x="Date",
+                y="Portfolio Value",
+                color="Variant",
+                title="Walk-Forward Portfolio Value",
+            )
+            st.plotly_chart(chart, use_container_width=True)
+        if not derivative_performance.empty:
+            st.markdown("**Portfolio Performance**")
+            st.dataframe(format_percent_columns(derivative_performance), use_container_width=True, hide_index=True)
+        if not derivative_event_summary.empty:
+            st.markdown("**Event Study By Chronological Split**")
+            st.dataframe(format_percent_columns(derivative_event_summary), use_container_width=True, hide_index=True)
+        if not derivative_events.empty:
+            st.markdown("**Backtest Events**")
+            st.dataframe(format_percent_columns(derivative_events), use_container_width=True, hide_index=True)
+            show_download("Download backtest events", derivative_events, "derivatives_backtest_events.csv")
+            show_download("Download backtest curve", derivative_curve, "derivatives_backtest_curve.csv")
+        st.caption(
+            "The Train, Validation, and Test periods are chronological 60% / 20% / 20% splits. Treat the strategy "
+            "as promising only when the full derivatives signal improves the untouched Test period over the equity-only baseline after costs."
+        )
