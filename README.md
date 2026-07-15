@@ -78,6 +78,15 @@ Use the `Rank by YoY growth` control to sort the results by Sales, Operating Pro
 - `output/latest/quarterly_results_all.csv`
 - `output/latest/quarterly_results_matching.csv`
 
+### Post-Earnings Stock Return Momentum
+
+Inside the `Quarterly Results` tab, `Post-Earnings Stock Return Momentum` is a separate price-momentum workflow. It uses only companies that reported the selected result quarter, downloads their fresh Yahoo Finance prices, and ranks them from highest to lowest using stock returns over 2, 5, and 10 trading days.
+
+The default weights are 20% for 2 days, 30% for 5 days, and 50% for 10 days. They can be adjusted in the dashboard before running the score. This is a stock-return momentum score, not an earnings-growth score; the earnings filter only determines which companies are eligible.
+
+- `output/latest/quarterly_stock_return_returns.csv`
+- `output/latest/quarterly_stock_return_momentum.csv`
+
 ## Local Setup
 
 ```powershell

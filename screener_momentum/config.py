@@ -27,6 +27,18 @@ DEFAULT_MOMENTUM_WEIGHTS: dict[str, float] = {
 
 DEFAULT_POSITIVE_RETURN_FILTERS = ("5 days ret", "15 Days Returns", "1M Return")
 
+POST_EARNINGS_STOCK_RETURN_PERIODS: dict[str, int] = {
+    "Earnings 2D Return": 2,
+    "Earnings 5D Return": 5,
+    "Earnings 10D Return": 10,
+}
+
+DEFAULT_POST_EARNINGS_STOCK_RETURN_WEIGHTS: dict[str, float] = {
+    "Earnings 2D Return": 0.20,
+    "Earnings 5D Return": 0.30,
+    "Earnings 10D Return": 0.50,
+}
+
 BENCHMARKS: dict[str, list[str]] = {
     "Nifty 50": ["^NSEI"],
     "Nifty Midcap": ["^NSEMDCP50", "^CNXMDCP", "NIFTY_MIDCAP_100.NS"],

@@ -9,6 +9,7 @@ import streamlit as st
 
 from screener_momentum.backtest import current_allocation, performance_summary
 from screener_momentum.config import (
+    DEFAULT_POST_EARNINGS_STOCK_RETURN_WEIGHTS,
     DEFAULT_MOMENTUM_WEIGHTS,
     DEFAULT_POSITIVE_RETURN_FILTERS,
     FundamentalThresholds,
@@ -27,6 +28,7 @@ from screener_momentum.pipeline import (
     run_fii_momentum_screen,
     run_fundamentals_screen,
     run_quarterly_results_screen,
+    run_quarterly_stock_return_momentum,
     run_momentum,
     score_and_save_momentum,
 )
@@ -781,7 +783,7 @@ with tabs[6]:
     quarterly_metrics[1].metric("Reported Selected Quarter", f"{len(ranked_quarterly):,}" if not ranked_quarterly.empty else "0")
     quarterly_metrics[2].metric("Current Ranking", f"{ranking_metric} YoY Growth")
 
-    quarterly_tabs = st.tabs(["Ranked Results", "All Quarterly Scan"])
+    quarterly_tabs = st.tabs(["Ranked Results", "All Quarterly Scan", "Post-Earnings Stock Return Momentum"])
     with quarterly_tabs[0]:
         if ranked_quarterly.empty:
             st.info("Run the scan to find companies with the selected quarter, or load a saved scan for the same quarter.")
@@ -801,4 +803,89 @@ with tabs[6]:
             st.caption(
                 f"Partial checkpoints are written to {paths['quarterly_results_partial']}. "
                 "Run / Resume continues only a checkpoint for the selected result quarter."
+            )
+    with quarterly_tabs[2]:
+        st.caption(
+            "Ranks the current stock-price reaction for companies that reported the selected quarter. "
+            "It uses 2-day, 5-day, and 10-day stock returns, with 10-day return weighted most heavily. "
+            "This is not an earnings-growth score."
+        )
+        weight_controls = st.columns([1, 1, 1, 1.25])
+        two_day_weight = weight_controls[0].number_input(
+            "2-day weight",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(DEFAULT_POST_EARNINGS_STOCK_RETURN_WEIGHTS["Earnings 2D Return"]),
+            step=0.05,
+        )
+        five_day_weight = weight_controls[1].number_input(
+            "5-day weight",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(DEFAULT_POST_EARNINGS_STOCK_RETURN_WEIGHTS["Earnings 5D Return"]),
+            step=0.05,
+        )
+        ten_day_weight = weight_controls[2].number_input(
+            "10-day weight",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(DEFAULT_POST_EARNINGS_STOCK_RETURN_WEIGHTS["Earnings 10D Return"]),
+            step=0.05,
+        )
+        run_stock_return_momentum = weight_controls[3].button(
+            "Run Stock Return Momentum",
+            type="primary",
+            use_container_width=True,
+        )
+        stock_return_weights = {
+            "Earnings 2D Return": float(two_day_weight),
+            "Earnings 5D Return": float(five_day_weight),
+            "Earnings 10D Return": float(ten_day_weight),
+        }
+
+        if run_stock_return_momentum:
+            if quarterly_all.empty:
+                st.error("Run or recover the quarterly-results scan first.")
+            else:
+                stock_return_progress = make_progress("Downloading fresh stock returns for quarterly reporters")
+                try:
+                    st.session_state["quarterly_stock_return_momentum"] = run_quarterly_stock_return_momentum(
+                        quarterly_all,
+                        target_period=target_quarter,
+                        weights=stock_return_weights,
+                        progress_callback=stock_return_progress,
+                        output_dir=OUTPUT_DIR,
+                        price_batch_size=config.price_batch_size,
+                    )
+                    st.success("Post-earnings stock return momentum is ready.")
+                except Exception as exc:
+                    st.error(f"Stock return momentum could not be calculated: {exc}")
+
+        if "quarterly_stock_return_momentum" not in st.session_state:
+            saved_stock_return_momentum = read_csv_if_exists(paths["quarterly_stock_return_momentum"])
+            if not saved_stock_return_momentum.empty:
+                st.session_state["quarterly_stock_return_momentum"] = saved_stock_return_momentum
+
+        stock_return_momentum = st.session_state.get("quarterly_stock_return_momentum", pd.DataFrame()).copy()
+        if not stock_return_momentum.empty and "Target Quarter" in stock_return_momentum.columns:
+            stock_return_momentum = stock_return_momentum[
+                stock_return_momentum["Target Quarter"].astype(str).str.strip().str.upper().eq(target_quarter.strip().upper())
+            ].copy()
+        score_column = "Post-Earnings Stock Return Momentum Score"
+        if score_column in stock_return_momentum.columns:
+            stock_return_momentum[score_column] = pd.to_numeric(stock_return_momentum[score_column], errors="coerce")
+            stock_return_momentum = stock_return_momentum.sort_values(score_column, ascending=False, na_position="last").reset_index(drop=True)
+
+        if stock_return_momentum.empty:
+            st.info("Run Stock Return Momentum to rank the selected quarter's reporters from highest to lowest stock-return momentum.")
+        else:
+            st.dataframe(format_percent_columns(stock_return_momentum), use_container_width=True, hide_index=True)
+            show_download(
+                "Download post-earnings stock return momentum",
+                stock_return_momentum,
+                f"post_earnings_stock_return_momentum_{target_quarter.replace(' ', '_')}.csv",
+            )
+            st.caption(
+                f"Saved price returns: {paths['quarterly_stock_return_returns']}. "
+                f"Saved ranking: {paths['quarterly_stock_return_momentum']}."
             )

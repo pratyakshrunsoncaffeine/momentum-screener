@@ -4,7 +4,10 @@ import pandas as pd
 from bs4 import BeautifulSoup
 
 from screener_momentum.fundamentals import extract_quarterly_results
-from screener_momentum.pipeline import prepare_quarterly_results
+from screener_momentum.pipeline import (
+    prepare_quarterly_results,
+    score_quarterly_stock_return_momentum,
+)
 
 
 class QuarterlyResultsTests(unittest.TestCase):
@@ -45,6 +48,19 @@ class QuarterlyResultsTests(unittest.TestCase):
 
         self.assertEqual(sales_order, ["HIGH", "LOW"])
         self.assertEqual(operating_profit_order, ["LOW", "HIGH"])
+
+    def test_stock_return_momentum_prioritizes_ten_day_return(self) -> None:
+        returns = pd.DataFrame(
+            [
+                {"Ticker": "TEN_DAY", "Earnings 2D Return": 1, "Earnings 5D Return": 1, "Earnings 10D Return": 12},
+                {"Ticker": "SHORT_TERM", "Earnings 2D Return": 5, "Earnings 5D Return": 5, "Earnings 10D Return": 4},
+            ]
+        )
+
+        ranked = score_quarterly_stock_return_momentum(returns)
+
+        self.assertEqual(ranked["Ticker"].tolist(), ["TEN_DAY", "SHORT_TERM"])
+        self.assertEqual(ranked["Post-Earnings Stock Return Momentum Rank"].tolist(), [1, 2])
 
 
 if __name__ == "__main__":

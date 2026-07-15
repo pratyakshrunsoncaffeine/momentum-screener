@@ -7,7 +7,11 @@ import pandas as pd
 import yfinance as yf
 
 from .backtest import current_allocation, performance_summary, walk_forward_backtest
-from .config import ScreeningConfig
+from .config import (
+    DEFAULT_POST_EARNINGS_STOCK_RETURN_WEIGHTS,
+    POST_EARNINGS_STOCK_RETURN_PERIODS,
+    ScreeningConfig,
+)
 from .fundamentals import (
     normalize_quarter_period,
     screen_dii_holdings,
@@ -52,6 +56,8 @@ def output_paths(output_dir: str | Path = "output/latest") -> dict[str, Path]:
         "quarterly_results_partial": root / "quarterly_results_partial.csv",
         "quarterly_results_all": root / "quarterly_results_all.csv",
         "quarterly_results_matching": root / "quarterly_results_matching.csv",
+        "quarterly_stock_return_returns": root / "quarterly_stock_return_returns.csv",
+        "quarterly_stock_return_momentum": root / "quarterly_stock_return_momentum.csv",
     }
 
 
@@ -252,6 +258,56 @@ def prepare_quarterly_results(
         result[ranking_column] = pd.to_numeric(result[ranking_column], errors="coerce")
         result = result.sort_values(ranking_column, ascending=False, na_position="last")
     return result.reset_index(drop=True)
+
+
+def run_quarterly_stock_return_momentum(
+    quarterly_all: pd.DataFrame,
+    target_period: str,
+    weights: dict[str, float] | None = None,
+    progress_callback: ProgressCallback | None = None,
+    output_dir: str | Path = "output/latest",
+    price_batch_size: int = 80,
+) -> pd.DataFrame:
+    """Score fresh stock-return momentum for companies reporting the selected quarter."""
+    candidates = prepare_quarterly_results(
+        quarterly_all,
+        target_period=target_period,
+        matching_only=True,
+    )
+    if candidates.empty:
+        return pd.DataFrame()
+    if "YFinance Ticker" not in candidates.columns:
+        raise ValueError("Quarterly scan is missing YFinance Ticker values. Run the quarterly scan again.")
+
+    paths = output_paths(output_dir)
+    prices = download_adjusted_close(
+        candidates["YFinance Ticker"].dropna().astype(str).tolist(),
+        batch_size=price_batch_size,
+        period="3mo",
+        progress_callback=progress_callback,
+    )
+    returns = calculate_returns(
+        candidates,
+        prices,
+        return_periods=POST_EARNINGS_STOCK_RETURN_PERIODS,
+        progress_callback=progress_callback,
+    )
+    momentum = score_quarterly_stock_return_momentum(returns, weights=weights)
+    save_frame(returns, paths["quarterly_stock_return_returns"])
+    save_frame(momentum, paths["quarterly_stock_return_momentum"])
+    return momentum
+
+
+def score_quarterly_stock_return_momentum(
+    returns: pd.DataFrame,
+    weights: dict[str, float] | None = None,
+) -> pd.DataFrame:
+    """Rank fresh post-earnings stock returns without a positive-return exclusion gate."""
+    active_weights = weights or DEFAULT_POST_EARNINGS_STOCK_RETURN_WEIGHTS
+    momentum = score_momentum(returns, weights=active_weights, positive_filters=())
+    momentum = momentum.rename(columns={"Momentum Score": "Post-Earnings Stock Return Momentum Score"})
+    momentum.insert(0, "Post-Earnings Stock Return Momentum Rank", range(1, len(momentum) + 1))
+    return momentum
 
 
 def prepare_fii_all(frame: pd.DataFrame) -> pd.DataFrame:

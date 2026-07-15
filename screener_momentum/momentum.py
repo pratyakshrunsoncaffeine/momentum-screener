@@ -86,7 +86,7 @@ def calculate_returns(
     for index, item in enumerate(records, start=1):
         yahoo_ticker = str(item["YFinance Ticker"]).upper()
         if yahoo_ticker not in prices.columns:
-            rows.append(_empty_row(item))
+            rows.append(_empty_row(item, periods))
             if progress_callback:
                 progress_callback(index, total, f"Calculated returns for {index:,} of {total:,} tickers")
             continue
@@ -113,14 +113,14 @@ def calculate_returns(
     return pd.DataFrame(rows)
 
 
-def _empty_row(item: dict[str, object]) -> dict[str, object]:
+def _empty_row(item: dict[str, object], return_periods: dict[str, int] | None = None) -> dict[str, object]:
     row = {
         **item,
         "CMP Rs.": np.nan,
         "Data Points": 0,
         "Price Error": "Ticker missing from Yahoo Finance response",
     }
-    for label in RETURN_PERIODS:
+    for label in (return_periods or RETURN_PERIODS):
         row[label] = np.nan
     return row
 
