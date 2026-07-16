@@ -44,6 +44,59 @@ BENCHMARKS: dict[str, list[str]] = {
     "Nifty Midcap": ["^NSEMDCP50", "^CNXMDCP", "NIFTY_MIDCAP_100.NS"],
 }
 
+NSE_SECTOR_INDICES: tuple[str, ...] = (
+    "Nifty Auto",
+    "Nifty Bank",
+    "Nifty Capital Goods",
+    "Nifty Cement",
+    "Nifty Chemicals",
+    "Nifty Commercial & Transport Services",
+    "Nifty Construction",
+    "Nifty Consumer Durables",
+    "Nifty Consumer Services",
+    "Nifty Financial Services",
+    "Nifty Financial Services 25/50",
+    "Nifty Financial Services Ex Bank",
+    "Nifty FMCG",
+    "Nifty Healthcare",
+    "Nifty Hospitals",
+    "Nifty Housing Finance",
+    "Nifty Insurance",
+    "Nifty IT",
+    "Nifty Media",
+    "Nifty Metal",
+    "Nifty NBFC",
+    "Nifty Oil & Gas",
+    "Nifty Pharma",
+    "Nifty Power",
+    "Nifty Private Bank",
+    "Nifty PSU Bank",
+    "Nifty Realty",
+    "Nifty REITs & Realty",
+    "Nifty Retail",
+    "Nifty Telecommunications",
+    "Nifty500 Healthcare",
+    "Nifty MidSmall Financial Services",
+    "Nifty MidSmall Healthcare",
+    "Nifty MidSmall IT & Telecom",
+)
+
+DEFAULT_NSE_SECTORS: tuple[str, ...] = (
+    "Nifty Auto",
+    "Nifty Bank",
+    "Nifty Financial Services",
+    "Nifty FMCG",
+    "Nifty Healthcare",
+    "Nifty IT",
+    "Nifty Media",
+    "Nifty Metal",
+    "Nifty Oil & Gas",
+    "Nifty Pharma",
+    "Nifty PSU Bank",
+    "Nifty Private Bank",
+    "Nifty Realty",
+)
+
 
 @dataclass(frozen=True)
 class FundamentalThresholds:

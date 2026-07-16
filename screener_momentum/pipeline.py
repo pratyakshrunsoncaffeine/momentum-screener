@@ -24,6 +24,7 @@ from .fundamentals import (
     screen_quarterly_results,
 )
 from .momentum import calculate_returns, download_adjusted_close, score_momentum
+from .sector_rotation import BENCHMARK_INDEX, NseSectorIndexProvider, calculate_sector_rotation
 from .universe import load_ticker_universe
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -72,6 +73,10 @@ def output_paths(output_dir: str | Path = "output/latest") -> dict[str, Path]:
         "derivatives_backtest_curve": root / "derivatives_backtest_curve.csv",
         "derivatives_backtest_summary": root / "derivatives_backtest_summary.csv",
         "derivatives_event_summary": root / "derivatives_event_summary.csv",
+        "sector_rotation_cache": root.parent / "sector_rotation_cache",
+        "sector_rotation_prices": root / "sector_rotation_prices.csv",
+        "sector_rotation_snapshot": root / "sector_rotation_snapshot.csv",
+        "sector_rotation_health": root / "sector_rotation_health.csv",
     }
 
 
@@ -87,6 +92,52 @@ def _read_saved_frame(path: Path) -> pd.DataFrame:
         return pd.read_csv(path)
     except pd.errors.EmptyDataError:
         return pd.DataFrame()
+
+
+def run_sector_rotation_screen(
+    sectors: list[str] | tuple[str, ...],
+    end_date: date,
+    history_months: int = 12,
+    progress_callback: ProgressCallback | None = None,
+    output_dir: str | Path = "output/latest",
+) -> dict[str, object]:
+    """Refresh official NSE sector-index history and save a rotation snapshot."""
+    if not sectors:
+        raise ValueError("Select at least one official NSE sector index.")
+    months = max(int(history_months), 7)
+    start_date = end_date - timedelta(days=months * 31)
+    paths = output_paths(output_dir)
+    provider = NseSectorIndexProvider(paths["sector_rotation_cache"])
+    prices, health = provider.fetch_many(
+        [BENCHMARK_INDEX, *sectors],
+        start_date=start_date,
+        end_date=end_date,
+        progress_callback=progress_callback,
+    )
+    failed = health.loc[health["Status"].eq("failed"), "Index"].astype(str).tolist() if not health.empty else []
+    if BENCHMARK_INDEX in failed:
+        raise RuntimeError("Official Nifty 50 history is unavailable from NSE and the local NSE cache.")
+    snapshot = calculate_sector_rotation(prices, sectors)
+    if snapshot.empty:
+        raise RuntimeError("NSE returned no common sector and benchmark history for this selection.")
+    save_frame(prices, paths["sector_rotation_prices"])
+    save_frame(snapshot, paths["sector_rotation_snapshot"])
+    save_frame(health, paths["sector_rotation_health"])
+    return {"prices": prices, "snapshot": snapshot, "health": health, "stale": False}
+
+
+def load_saved_sector_rotation(
+    output_dir: str | Path = "output/latest",
+) -> dict[str, object]:
+    """Recover the last completed official NSE sector rotation run."""
+    paths = output_paths(output_dir)
+    prices = _read_saved_frame(paths["sector_rotation_prices"])
+    snapshot = _read_saved_frame(paths["sector_rotation_snapshot"])
+    health = _read_saved_frame(paths["sector_rotation_health"])
+    if prices.empty or snapshot.empty:
+        raise FileNotFoundError("No saved NSE sector rotation run is available yet.")
+    prices["Date"] = pd.to_datetime(prices.get("Date"), errors="coerce")
+    return {"prices": prices, "snapshot": snapshot, "health": health, "stale": True}
 
 
 def _download_nifty_prices(start_date: date, end_date: date) -> pd.DataFrame:

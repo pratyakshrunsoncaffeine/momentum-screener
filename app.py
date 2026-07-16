@@ -10,9 +10,11 @@ import streamlit as st
 
 from screener_momentum.backtest import current_allocation, performance_summary
 from screener_momentum.config import (
+    DEFAULT_NSE_SECTORS,
     DEFAULT_POST_EARNINGS_STOCK_RETURN_WEIGHTS,
     DEFAULT_MOMENTUM_WEIGHTS,
     DEFAULT_POSITIVE_RETURN_FILTERS,
+    NSE_SECTOR_INDICES,
     DerivativesSignalConfig,
     FundamentalThresholds,
     ScreeningConfig,
@@ -22,6 +24,7 @@ from screener_momentum.pipeline import (
     finalize_dii_momentum_screen,
     finalize_fii_momentum_screen,
     finalize_quarterly_results_screen,
+    load_saved_sector_rotation,
     load_saved_returns,
     load_saved_derivatives_results,
     output_paths,
@@ -35,9 +38,11 @@ from screener_momentum.pipeline import (
     run_fundamentals_screen,
     run_quarterly_results_screen,
     run_quarterly_stock_return_momentum,
+    run_sector_rotation_screen,
     run_momentum,
     score_and_save_momentum,
 )
+from screener_momentum.sector_rotation import normalized_performance
 
 
 ROOT = Path(__file__).resolve().parent
@@ -476,6 +481,7 @@ tabs = st.tabs(
         "DII Accumulation",
         "Quarterly Results",
         "Derivatives Momentum",
+        "Sector Rotation",
     ]
 )
 
@@ -1215,3 +1221,165 @@ with tabs[7]:
             "The Train, Validation, and Test periods are chronological 60% / 20% / 20% splits. Treat the strategy "
             "as promising only when the full derivatives signal improves the untouched Test period over the equity-only baseline after costs."
         )
+
+
+with tabs[8]:
+    st.subheader("NSE Sector Rotation Trend")
+    st.caption(
+        "Price-based relative rotation from official NSE sector-index closes. This measures sector performance and momentum, not institutional money flow."
+    )
+
+    selected_sectors = st.multiselect(
+        "Official NSE sector indices",
+        options=list(NSE_SECTOR_INDICES),
+        default=list(DEFAULT_NSE_SECTORS),
+        key="sector_rotation_selection",
+    )
+    sector_controls = st.columns([1, 1, 1, 1])
+    sector_end_date = sector_controls[0].date_input(
+        "Analysis end date",
+        value=date.today() - timedelta(days=1),
+        max_value=date.today(),
+        key="sector_rotation_end_date",
+    )
+    sector_history_months = sector_controls[1].slider(
+        "History window (months)",
+        min_value=7,
+        max_value=36,
+        value=12,
+        key="sector_rotation_history_months",
+    )
+    refresh_sector_data = sector_controls[2].button(
+        "Refresh NSE Sector Data",
+        type="primary",
+        use_container_width=True,
+    )
+    use_saved_sector_data = sector_controls[3].button(
+        "Use Saved Sector Data",
+        use_container_width=True,
+    )
+
+    if refresh_sector_data:
+        if not selected_sectors:
+            st.error("Select at least one sector index before refreshing NSE data.")
+        else:
+            sector_progress = make_progress("Downloading official NSE sector-index history")
+            try:
+                st.session_state["sector_rotation_results"] = run_sector_rotation_screen(
+                    selected_sectors,
+                    end_date=sector_end_date,
+                    history_months=int(sector_history_months),
+                    progress_callback=sector_progress,
+                    output_dir=OUTPUT_DIR,
+                )
+                st.success("NSE sector rotation data and ranking are ready.")
+            except Exception as exc:
+                try:
+                    st.session_state["sector_rotation_results"] = load_saved_sector_rotation(OUTPUT_DIR)
+                    st.warning(f"NSE refresh failed ({exc}). Showing the last saved official NSE snapshot.")
+                except FileNotFoundError:
+                    st.error(f"Sector rotation is unavailable because NSE could not be reached and no saved run exists: {exc}")
+
+    if use_saved_sector_data:
+        try:
+            st.session_state["sector_rotation_results"] = load_saved_sector_rotation(OUTPUT_DIR)
+            st.success("Loaded the last saved official NSE sector rotation run.")
+        except FileNotFoundError as exc:
+            st.error(str(exc))
+
+    sector_results = st.session_state.get("sector_rotation_results", {})
+    sector_snapshot = sector_results.get("snapshot", pd.DataFrame()).copy()
+    sector_prices = sector_results.get("prices", pd.DataFrame()).copy()
+    sector_health = sector_results.get("health", pd.DataFrame()).copy()
+    sector_stale = bool(sector_results.get("stale", False))
+
+    if sector_snapshot.empty:
+        st.info("Refresh official NSE sector data or load a previously saved sector rotation run.")
+    else:
+        if sector_stale:
+            data_date = sector_snapshot.get("Data Date", pd.Series(["unknown"])).iloc[0]
+            st.warning(f"Saved NSE data is being shown. The latest common data date is {data_date}.")
+
+        status_counts = sector_snapshot.get("Rotation Status", pd.Series(dtype=str)).value_counts()
+        status_columns = st.columns(4)
+        for column, status in zip(status_columns, ("Leading", "Improving", "Weakening", "Lagging")):
+            column.metric(status, f"{int(status_counts.get(status, 0)):,}")
+
+        visual_columns = st.columns(2)
+        heatmap_columns = [
+            "1W Return %",
+            "1M Return %",
+            "3M Return %",
+            "6M Return %",
+            "1M Excess vs Nifty 50 %",
+            "3M Excess vs Nifty 50 %",
+            "Relative Momentum %",
+        ]
+        heatmap_frame = sector_snapshot.set_index("Sector")[heatmap_columns].apply(pd.to_numeric, errors="coerce")
+        heatmap = px.imshow(
+            heatmap_frame,
+            color_continuous_scale="RdYlGn",
+            color_continuous_midpoint=0,
+            aspect="auto",
+            labels={"color": "%"},
+            title="Returns And Relative Strength",
+        )
+        heatmap.update_layout(height=max(430, 28 * len(heatmap_frame) + 150))
+        visual_columns[0].plotly_chart(heatmap, use_container_width=True)
+
+        scatter_frame = sector_snapshot.copy()
+        scatter_frame["Relative Strength 3M %"] = pd.to_numeric(
+            scatter_frame["Relative Strength 3M %"], errors="coerce"
+        )
+        scatter_frame["Relative Momentum %"] = pd.to_numeric(
+            scatter_frame["Relative Momentum %"], errors="coerce"
+        )
+        scatter = px.scatter(
+            scatter_frame.dropna(subset=["Relative Strength 3M %", "Relative Momentum %"]),
+            x="Relative Strength 3M %",
+            y="Relative Momentum %",
+            color="Rotation Status",
+            hover_name="Sector",
+            hover_data=["Rotation Rank", "Rotation Score", "Rank Change"],
+            category_orders={"Rotation Status": ["Leading", "Improving", "Weakening", "Lagging"]},
+            color_discrete_map={
+                "Leading": "#16845b",
+                "Improving": "#2f6fbb",
+                "Weakening": "#d08700",
+                "Lagging": "#b44343",
+            },
+            title="Relative Rotation Quadrants",
+        )
+        scatter.add_hline(y=0, line_width=1, line_color="#777777")
+        scatter.add_vline(x=0, line_width=1, line_color="#777777")
+        scatter.update_traces(marker={"size": 11})
+        scatter.update_layout(height=max(430, 28 * len(scatter_frame) + 150))
+        visual_columns[1].plotly_chart(scatter, use_container_width=True)
+
+        st.markdown("**Sector Ranking**")
+        st.dataframe(format_percent_columns(sector_snapshot), use_container_width=True, hide_index=True)
+        show_download("Download sector rotation CSV", sector_snapshot, "sector_rotation_snapshot.csv")
+
+        chart_sectors = [sector for sector in selected_sectors if sector in set(sector_snapshot["Sector"])]
+        normalized_sector_prices = normalized_performance(
+            sector_prices,
+            chart_sectors,
+            trading_days=min(int(sector_history_months) * 21, 504),
+        )
+        if not normalized_sector_prices.empty:
+            performance_chart = px.line(
+                normalized_sector_prices,
+                x="Date",
+                y="Normalized Value",
+                color="Index",
+                title="Sector Performance Versus Nifty 50 (Start = 100)",
+            )
+            performance_chart.add_hline(y=100, line_width=1, line_dash="dot", line_color="#777777")
+            st.plotly_chart(performance_chart, use_container_width=True)
+
+        with st.expander("NSE data health"):
+            if sector_health.empty:
+                st.info("No per-index health details were saved for this run.")
+            else:
+                st.dataframe(sector_health, use_container_width=True, hide_index=True)
+                show_download("Download sector data health", sector_health, "sector_rotation_health.csv")

@@ -126,6 +126,21 @@ Saved derivatives files:
 - `output/latest/derivatives_backtest_summary.csv`
 - `output/latest/derivatives_event_summary.csv`
 
+## NSE Sector Rotation
+
+The `Sector Rotation` tab compares official NSE sector price indices with Nifty 50. It downloads daily index closes directly from NSE Indices, aligns every selected sector to the latest common trading date, and calculates 1-week, 1-month, 3-month, and 6-month returns and excess returns.
+
+The relative-rotation view uses 3-month excess return as relative strength and the change in monthly excess return as relative momentum. Sectors are classified as Leading, Improving, Weakening, or Lagging, then ranked with 40% weight on 1-month excess return, 35% on 3-month excess return, and 25% on relative-momentum acceleration. This is price-based trend analysis, not a measure of institutional fund flows.
+
+Use `Refresh NSE Sector Data` for a new official download or `Use Saved Sector Data` to recover the most recent completed run. If NSE is temporarily unavailable during a refresh, the dashboard shows a stale-data warning before using saved NSE data. Yahoo Finance is never substituted for this section.
+
+Saved sector files:
+
+- `output/sector_rotation_cache/` for per-index official NSE history.
+- `output/latest/sector_rotation_prices.csv`
+- `output/latest/sector_rotation_snapshot.csv`
+- `output/latest/sector_rotation_health.csv`
+
 ## Local Setup
 
 ```powershell
