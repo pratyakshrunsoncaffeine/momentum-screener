@@ -1,16 +1,42 @@
 import unittest
+import tempfile
+from pathlib import Path
 
 import pandas as pd
 from bs4 import BeautifulSoup
 
 from screener_momentum.fundamentals import extract_quarterly_results
 from screener_momentum.pipeline import (
+    output_paths,
     prepare_quarterly_results,
+    reset_quarterly_results_scan,
     score_quarterly_stock_return_momentum,
 )
 
 
 class QuarterlyResultsTests(unittest.TestCase):
+    def test_full_restart_removes_only_quarterly_scan_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = output_paths(root)
+            quarterly_keys = (
+                "quarterly_results_partial",
+                "quarterly_results_all",
+                "quarterly_results_matching",
+                "quarterly_stock_return_returns",
+                "quarterly_stock_return_momentum",
+            )
+            for key in quarterly_keys:
+                paths[key].parent.mkdir(parents=True, exist_ok=True)
+                paths[key].write_text("saved", encoding="utf-8")
+            paths["momentum"].write_text("keep", encoding="utf-8")
+
+            removed = reset_quarterly_results_scan("Jun 2026", output_dir=root)
+
+            self.assertEqual(set(removed), {paths[key] for key in quarterly_keys})
+            self.assertTrue(all(not paths[key].exists() for key in quarterly_keys))
+            self.assertTrue(paths["momentum"].exists())
+
     def test_extracts_qoq_and_yoy_for_all_metrics(self) -> None:
         html = """
         <section id="quarters"><table>

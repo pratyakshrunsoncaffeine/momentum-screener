@@ -8,6 +8,14 @@ import pandas as pd
 import yfinance as yf
 
 from .backtest import current_allocation, performance_summary, walk_forward_backtest
+from .correlation import (
+    MacroFactorProvider,
+    NseHistoricalEquityProvider,
+    add_ridge_regression,
+    calculate_correlations,
+    select_correlation_leaders,
+    select_relationship_leaders,
+)
 from .config import (
     DEFAULT_POST_EARNINGS_STOCK_RETURN_WEIGHTS,
     POST_EARNINGS_STOCK_RETURN_PERIODS,
@@ -77,6 +85,17 @@ def output_paths(output_dir: str | Path = "output/latest") -> dict[str, Path]:
         "sector_rotation_prices": root / "sector_rotation_prices.csv",
         "sector_rotation_snapshot": root / "sector_rotation_snapshot.csv",
         "sector_rotation_health": root / "sector_rotation_health.csv",
+        "correlation_cache": root.parent / "correlation_cache",
+        "correlation_stock_prices": root / "correlation_stock_prices.csv",
+        "correlation_factors": root / "correlation_factors.csv",
+        "correlation_all": root / "correlation_all.csv",
+        "correlation_top_positive": root / "correlation_top_positive.csv",
+        "correlation_top_negative": root / "correlation_top_negative.csv",
+        "correlation_health": root / "correlation_health.csv",
+        "correlation_stock_health": root / "correlation_stock_health.csv",
+        "correlation_ridge_top_positive": root / "correlation_ridge_top_positive.csv",
+        "correlation_ridge_top_negative": root / "correlation_ridge_top_negative.csv",
+        "correlation_run_metadata": root / "correlation_run_metadata.csv",
     }
 
 
@@ -138,6 +157,291 @@ def load_saved_sector_rotation(
         raise FileNotFoundError("No saved NSE sector rotation run is available yet.")
     prices["Date"] = pd.to_datetime(prices.get("Date"), errors="coerce")
     return {"prices": prices, "snapshot": snapshot, "health": health, "stale": True}
+
+
+def run_correlation_screen(
+    ticker_csv: str | Path,
+    factors: list[str] | tuple[str, ...],
+    end_date: date,
+    lookback_years: int = 3,
+    frequency: str = "Weekly",
+    method: str = "Pearson",
+    relation: str = "Same period",
+    min_observations: int = 40,
+    top_n: int = 10,
+    ridge_alpha: float = 1.0,
+    progress_callback: ProgressCallback | None = None,
+    output_dir: str | Path = "output/latest",
+) -> dict[str, object]:
+    """Download as-of stock/factor history, calculate relationships, and save recovery files."""
+    if not factors:
+        raise ValueError("Select at least one macro factor.")
+    years = max(int(lookback_years), 1)
+    start_date = end_date - timedelta(days=years * 366 + 45)
+    paths = output_paths(output_dir)
+    universe = load_ticker_universe(ticker_csv)
+    tickers = universe["YFinance Ticker"].astype(str).tolist()
+
+    prices = download_adjusted_close(
+        tickers,
+        start_date=start_date,
+        end_date=end_date,
+        progress_callback=progress_callback,
+    )
+    yahoo_available = set(prices.dropna(axis=1, how="all").columns) if not prices.empty else set()
+    yahoo_missing = [ticker for ticker in tickers if ticker not in yahoo_available]
+    if yahoo_missing:
+        retry_prices = download_adjusted_close(
+            yahoo_missing,
+            batch_size=10,
+            start_date=start_date,
+            end_date=end_date,
+            progress_callback=progress_callback,
+        )
+        if not retry_prices.empty:
+            prices = pd.concat([prices, retry_prices], axis=1)
+            prices = prices.loc[:, ~prices.columns.duplicated(keep="last")]
+            yahoo_available.update(retry_prices.dropna(axis=1, how="all").columns)
+
+    nse_missing = [ticker for ticker in tickers if ticker not in yahoo_available]
+    nse_health = pd.DataFrame()
+    nse_available: set[str] = set()
+    if nse_missing:
+        nse_provider = NseHistoricalEquityProvider(paths["correlation_cache"] / "nse_equity")
+        nse_prices, nse_health = nse_provider.fetch_many(
+            nse_missing,
+            start_date=start_date,
+            end_date=end_date,
+            frequency=frequency,
+            progress_callback=progress_callback,
+        )
+        if not nse_prices.empty:
+            prices = pd.concat([prices, nse_prices], axis=1)
+            prices = prices.loc[:, ~prices.columns.duplicated(keep="last")]
+            nse_available.update(nse_prices.dropna(axis=1, how="all").columns)
+
+    if prices.empty:
+        raise RuntimeError("Neither Yahoo Finance nor the official NSE fallback returned stock price history.")
+    prices = prices.loc[pd.Timestamp(start_date) : pd.Timestamp(end_date)].copy()
+    save_frame(prices.rename_axis("Date").reset_index(), paths["correlation_stock_prices"])
+
+    nse_health_lookup = (
+        nse_health.set_index("YFinance Ticker").to_dict("index") if not nse_health.empty else {}
+    )
+    stock_health_rows: list[dict[str, object]] = []
+    for ticker in tickers:
+        if ticker in yahoo_available:
+            series = prices[ticker].dropna() if ticker in prices else pd.Series(dtype=float)
+            stock_health_rows.append(
+                {
+                    "Ticker": ticker.removesuffix(".NS"),
+                    "YFinance Ticker": ticker,
+                    "Price Source": "Yahoo Finance",
+                    "Price Basis": "Auto-adjusted close",
+                    "Status": "downloaded",
+                    "Rows": int(series.shape[0]),
+                    "First Date": series.index.min().date().isoformat() if not series.empty else "",
+                    "Last Date": series.index.max().date().isoformat() if not series.empty else "",
+                    "Message": "",
+                }
+            )
+        elif ticker in nse_available:
+            stock_health_rows.append(
+                {
+                    **nse_health_lookup.get(ticker, {}),
+                    "YFinance Ticker": ticker,
+                }
+            )
+        else:
+            fallback_health = nse_health_lookup.get(
+                ticker,
+                {
+                    "Ticker": ticker.removesuffix(".NS"),
+                    "Price Source": "Unavailable",
+                    "Price Basis": "",
+                    "Status": "failed",
+                    "Rows": 0,
+                    "First Date": "",
+                    "Last Date": "",
+                    "Message": "No usable Yahoo Finance or official NSE equity-series history.",
+                },
+            )
+            stock_health_rows.append({**fallback_health, "YFinance Ticker": ticker})
+    stock_health = pd.DataFrame(stock_health_rows)
+    save_frame(stock_health, paths["correlation_stock_health"])
+
+    provider = MacroFactorProvider(paths["correlation_cache"])
+    factor_levels, health = provider.fetch_many(
+        list(factors),
+        start_date=start_date,
+        end_date=end_date,
+        progress_callback=progress_callback,
+    )
+    if not factor_levels:
+        raise RuntimeError("No selected macro factor could be downloaded or recovered from cache.")
+
+    results, factor_history = calculate_correlations(
+        universe,
+        prices,
+        factor_levels,
+        requested_frequency=frequency,
+        method=method,
+        relation=relation,
+        min_observations=min_observations,
+        progress_callback=progress_callback,
+    )
+    results = add_ridge_regression(
+        results,
+        prices,
+        factor_history,
+        relation=relation,
+        alpha=ridge_alpha,
+        min_observations=min_observations,
+    )
+    if results.empty:
+        raise RuntimeError(
+            "No stock-factor pair met the minimum observation requirement. Reduce the minimum observations or increase the lookback."
+        )
+    positive, inverse = select_correlation_leaders(results, top_n=top_n)
+    ridge_positive, ridge_inverse = select_relationship_leaders(
+        results,
+        top_n=top_n,
+        ranking_metric="Ridge Coefficient",
+    )
+    health = health.copy()
+    health["Requested Frequency"] = frequency
+    health["Relation"] = relation
+    health["Method"] = method
+    health["Analysis End Date"] = end_date.isoformat()
+    health["Ticker Universe"] = len(universe)
+    health["Stocks With Prices"] = int(prices.notna().any(axis=0).sum())
+    metadata = pd.DataFrame(
+        [
+            {
+                "Saved At UTC": pd.Timestamp.now(tz="UTC").isoformat(),
+                "Analysis End Date": end_date.isoformat(),
+                "Lookback Years": years,
+                "Requested Frequency": frequency,
+                "Correlation Method": method,
+                "Relationship": relation,
+                "Minimum Observations": int(min_observations),
+                "Top Results Per Direction": int(top_n),
+                "Ridge Alpha": float(ridge_alpha),
+                "Factors": " | ".join(factors),
+                "Ticker Universe": len(universe),
+                "Stocks With Prices": int(prices.notna().any(axis=0).sum()),
+                "Stock-Factor Pairs": len(results),
+            }
+        ]
+    )
+
+    save_frame(factor_history, paths["correlation_factors"])
+    save_frame(results, paths["correlation_all"])
+    save_frame(positive, paths["correlation_top_positive"])
+    save_frame(inverse, paths["correlation_top_negative"])
+    save_frame(ridge_positive, paths["correlation_ridge_top_positive"])
+    save_frame(ridge_inverse, paths["correlation_ridge_top_negative"])
+    save_frame(health, paths["correlation_health"])
+    save_frame(metadata, paths["correlation_run_metadata"])
+    return {
+        "results": results,
+        "positive": positive,
+        "inverse": inverse,
+        "ridge_positive": ridge_positive,
+        "ridge_inverse": ridge_inverse,
+        "prices": prices.rename_axis("Date").reset_index(),
+        "factors": factor_history,
+        "health": health,
+        "stock_health": stock_health,
+        "metadata": metadata,
+        "stale": False,
+    }
+
+
+def load_saved_correlation(
+    output_dir: str | Path = "output/latest",
+) -> dict[str, object]:
+    """Recover the most recent completed correlation scan without another market-data request."""
+    paths = output_paths(output_dir)
+    results = _read_saved_frame(paths["correlation_all"])
+    factor_history = _read_saved_frame(paths["correlation_factors"])
+    health = _read_saved_frame(paths["correlation_health"])
+    stock_health = _read_saved_frame(paths["correlation_stock_health"])
+    prices = _read_saved_frame(paths["correlation_stock_prices"])
+    metadata = _read_saved_frame(paths["correlation_run_metadata"])
+    if results.empty:
+        raise FileNotFoundError("No saved correlation scan is available yet.")
+    positive = _read_saved_frame(paths["correlation_top_positive"])
+    inverse = _read_saved_frame(paths["correlation_top_negative"])
+    if positive.empty and inverse.empty:
+        positive, inverse = select_correlation_leaders(results, top_n=10)
+    if not factor_history.empty:
+        factor_history["Date"] = pd.to_datetime(factor_history["Date"], errors="coerce")
+    if not prices.empty:
+        prices["Date"] = pd.to_datetime(prices["Date"], errors="coerce")
+    relation = (
+        str(metadata.iloc[0].get("Relationship", "Same period"))
+        if not metadata.empty
+        else str(results.get("Relation", pd.Series(["Same period"])).iloc[0])
+    )
+    ridge_alpha = float(metadata.iloc[0].get("Ridge Alpha", 1.0)) if not metadata.empty else 1.0
+    min_observations = (
+        int(metadata.iloc[0].get("Minimum Observations", 24))
+        if not metadata.empty
+        else int(pd.to_numeric(results.get("Observations"), errors="coerce").dropna().min())
+    )
+    if "Ridge Coefficient" not in results.columns and not prices.empty and not factor_history.empty:
+        price_frame = prices.set_index("Date")
+        results = add_ridge_regression(
+            results,
+            price_frame,
+            factor_history,
+            relation=relation,
+            alpha=ridge_alpha,
+            min_observations=min_observations,
+        )
+        save_frame(results, paths["correlation_all"])
+    ridge_positive, ridge_inverse = select_relationship_leaders(
+        results,
+        top_n=10,
+        ranking_metric="Ridge Coefficient",
+    )
+    save_frame(ridge_positive, paths["correlation_ridge_top_positive"])
+    save_frame(ridge_inverse, paths["correlation_ridge_top_negative"])
+    if metadata.empty:
+        metadata = pd.DataFrame(
+            [
+                {
+                    "Saved At UTC": pd.Timestamp.now(tz="UTC").isoformat(),
+                    "Analysis End Date": results.get("Data End", pd.Series([""])).max(),
+                    "Lookback Years": "",
+                    "Requested Frequency": results.get("Effective Frequency", pd.Series([""])).mode().iloc[0],
+                    "Correlation Method": results.get("Method", pd.Series([""])).iloc[0],
+                    "Relationship": relation,
+                    "Minimum Observations": min_observations,
+                    "Top Results Per Direction": 10,
+                    "Ridge Alpha": ridge_alpha,
+                    "Factors": " | ".join(results["Factor"].dropna().astype(str).unique()),
+                    "Ticker Universe": len(stock_health),
+                    "Stocks With Prices": int(prices.drop(columns=["Date"], errors="ignore").notna().any().sum()),
+                    "Stock-Factor Pairs": len(results),
+                }
+            ]
+        )
+        save_frame(metadata, paths["correlation_run_metadata"])
+    return {
+        "results": results,
+        "positive": positive,
+        "inverse": inverse,
+        "ridge_positive": ridge_positive,
+        "ridge_inverse": ridge_inverse,
+        "prices": prices,
+        "factors": factor_history,
+        "health": health,
+        "stock_health": stock_health,
+        "metadata": metadata,
+        "stale": True,
+    }
 
 
 def _download_nifty_prices(start_date: date, end_date: date) -> pd.DataFrame:
@@ -281,6 +585,35 @@ def download_derivatives_eod_data(
     health = provider.download_range(start_date, end_date, progress_callback=progress_callback)
     save_frame(health, paths["derivatives_data_health"])
     return health
+
+
+def reset_derivatives_eod_data(
+    start_date: date,
+    end_date: date,
+    output_dir: str | Path = "output/latest",
+) -> dict[str, object]:
+    """Clear a selected NSE EOD cache range and all derived derivatives outputs."""
+    if start_date > end_date:
+        raise ValueError("Derivatives data start date must be on or before the end date.")
+    paths = output_paths(output_dir)
+    provider = NseEodDerivativesProvider(paths["derivatives_cache"])
+    removed_cache_directories = provider.reset_range(start_date, end_date)
+    output_keys = (
+        "derivatives_contracts",
+        "derivatives_daily_features",
+        "derivatives_signals",
+        "derivatives_rejections",
+        "derivatives_data_health",
+        "derivatives_backtest_events",
+        "derivatives_backtest_curve",
+        "derivatives_backtest_summary",
+        "derivatives_event_summary",
+    )
+    removed_outputs = _remove_output_files(paths, output_keys)
+    return {
+        "removed_cache_directories": removed_cache_directories,
+        "removed_outputs": removed_outputs,
+    }
 
 
 def run_derivatives_momentum_screen(
@@ -433,6 +766,22 @@ def run_fii_momentum_screen(
     )
 
 
+def reset_fii_momentum_scan(output_dir: str | Path = "output/latest") -> list[Path]:
+    """Clear only FII scan checkpoints and derived FII rankings."""
+    paths = output_paths(output_dir)
+    return _remove_output_files(
+        paths,
+        (
+            "fii_partial",
+            "fii_marketcap_partial",
+            "fii_all",
+            "fii_top",
+            "fii_momentum",
+            "fii_final",
+        ),
+    )
+
+
 def run_dii_momentum_screen(
     csv_path: str,
     config: ScreeningConfig,
@@ -472,6 +821,22 @@ def run_dii_momentum_screen(
     )
 
 
+def reset_dii_momentum_scan(output_dir: str | Path = "output/latest") -> list[Path]:
+    """Clear only DII scan checkpoints and derived DII rankings."""
+    paths = output_paths(output_dir)
+    return _remove_output_files(
+        paths,
+        (
+            "dii_partial",
+            "dii_marketcap_partial",
+            "dii_all",
+            "dii_top",
+            "dii_momentum",
+            "dii_final",
+        ),
+    )
+
+
 def run_quarterly_results_screen(
     csv_path: str,
     target_period: str,
@@ -491,6 +856,35 @@ def run_quarterly_results_screen(
         checkpoint_path=paths["quarterly_results_partial"],
     )
     return finalize_quarterly_results_screen(all_results, normalized_target, output_dir=output_dir)
+
+
+def reset_quarterly_results_scan(
+    target_period: str,
+    output_dir: str | Path = "output/latest",
+) -> list[Path]:
+    """Clear only quarterly-result checkpoints so the next scan starts at ticker one."""
+    normalized_target = normalize_quarter_period(target_period)
+    if normalized_target is None:
+        raise ValueError("Result quarter must use a format such as 'Jun 2026'.")
+    paths = output_paths(output_dir)
+    reset_keys = (
+        "quarterly_results_partial",
+        "quarterly_results_all",
+        "quarterly_results_matching",
+        "quarterly_stock_return_returns",
+        "quarterly_stock_return_momentum",
+    )
+    return _remove_output_files(paths, reset_keys)
+
+
+def _remove_output_files(paths: dict[str, Path], keys: tuple[str, ...]) -> list[Path]:
+    removed: list[Path] = []
+    for key in keys:
+        path = paths[key]
+        if path.exists():
+            path.unlink()
+            removed.append(path)
+    return removed
 
 
 def finalize_quarterly_results_screen(

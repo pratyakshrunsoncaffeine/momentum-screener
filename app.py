@@ -9,6 +9,12 @@ import plotly.express as px
 import streamlit as st
 
 from screener_momentum.backtest import current_allocation, performance_summary
+from screener_momentum.correlation import (
+    FACTOR_CATALOG,
+    correlation_matrix,
+    normalized_factor_stock_performance,
+    select_relationship_leaders,
+)
 from screener_momentum.config import (
     DEFAULT_NSE_SECTORS,
     DEFAULT_POST_EARNINGS_STOCK_RETURN_WEIGHTS,
@@ -24,6 +30,7 @@ from screener_momentum.pipeline import (
     finalize_dii_momentum_screen,
     finalize_fii_momentum_screen,
     finalize_quarterly_results_screen,
+    load_saved_correlation,
     load_saved_sector_rotation,
     load_saved_returns,
     load_saved_derivatives_results,
@@ -38,8 +45,13 @@ from screener_momentum.pipeline import (
     run_fundamentals_screen,
     run_quarterly_results_screen,
     run_quarterly_stock_return_momentum,
+    run_correlation_screen,
     run_sector_rotation_screen,
     run_momentum,
+    reset_derivatives_eod_data,
+    reset_dii_momentum_scan,
+    reset_fii_momentum_scan,
+    reset_quarterly_results_scan,
     score_and_save_momentum,
 )
 from screener_momentum.sector_rotation import normalized_performance
@@ -482,6 +494,7 @@ tabs = st.tabs(
         "Quarterly Results",
         "Derivatives Momentum",
         "Sector Rotation",
+        "Correlation",
     ]
 )
 
@@ -565,16 +578,24 @@ with tabs[4]:
         "This scanner scrapes FII holding change for the full ticker universe, ranks positive FII accumulation, "
         "then momentum-scores only the top FII shortlist."
     )
-    controls = st.columns([1, 1, 1, 1])
+    controls = st.columns([1, 1, 1, 1, 1])
     fii_top_n = controls[0].number_input("FII shortlist", min_value=10, max_value=200, value=50, step=5)
     fii_final_n = controls[1].number_input("Final picks", min_value=1, max_value=20, value=3, step=1)
     run_fii = controls[2].button("Run / Resume FII Scan", type="primary", use_container_width=True)
-    recover_fii = controls[3].button("Use Saved FII Scan", use_container_width=True)
+    restart_fii = controls[3].button(
+        "Run Full Scan From Beginning",
+        key="restart_fii_scan",
+        use_container_width=True,
+    )
+    recover_fii = controls[4].button("Use Saved FII Scan", use_container_width=True)
 
-    if run_fii:
+    if run_fii or restart_fii:
         fii_progress = make_progress("Scraping Screener.in FII holdings and market caps")
         price_progress = make_progress("Fetching shortlist prices")
         try:
+            if restart_fii:
+                reset_fii_momentum_scan(output_dir=OUTPUT_DIR)
+                st.session_state.pop("fii_results", None)
             st.session_state["fii_results"] = run_fii_momentum_screen(
                 csv_path,
                 config,
@@ -584,7 +605,7 @@ with tabs[4]:
                 price_progress_callback=price_progress,
                 output_dir=OUTPUT_DIR,
             )
-            st.success("FII accumulation scan complete.")
+            st.success("Fresh full FII scan complete." if restart_fii else "FII accumulation scan complete.")
         except Exception as exc:
             st.error(f"FII scan stopped before finalization: {exc}")
             saved_preview = load_saved_fii_preview()
@@ -655,16 +676,24 @@ with tabs[5]:
         "This scanner scrapes DII holding change for the full ticker universe, ranks positive DII accumulation, "
         "then momentum-scores only the top DII shortlist."
     )
-    controls = st.columns([1, 1, 1, 1])
+    controls = st.columns([1, 1, 1, 1, 1])
     dii_top_n = controls[0].number_input("DII shortlist", min_value=10, max_value=200, value=50, step=5)
     dii_final_n = controls[1].number_input("DII final picks", min_value=1, max_value=20, value=3, step=1)
     run_dii = controls[2].button("Run / Resume DII Scan", type="primary", use_container_width=True)
-    recover_dii = controls[3].button("Use Saved DII Scan", use_container_width=True)
+    restart_dii = controls[3].button(
+        "Run Full Scan From Beginning",
+        key="restart_dii_scan",
+        use_container_width=True,
+    )
+    recover_dii = controls[4].button("Use Saved DII Scan", use_container_width=True)
 
-    if run_dii:
+    if run_dii or restart_dii:
         dii_progress = make_progress("Scraping Screener.in DII holdings and market caps")
         price_progress = make_progress("Fetching DII shortlist prices")
         try:
+            if restart_dii:
+                reset_dii_momentum_scan(output_dir=OUTPUT_DIR)
+                st.session_state.pop("dii_results", None)
             st.session_state["dii_results"] = run_dii_momentum_screen(
                 csv_path,
                 config,
@@ -674,7 +703,7 @@ with tabs[5]:
                 price_progress_callback=price_progress,
                 output_dir=OUTPUT_DIR,
             )
-            st.success("DII accumulation scan complete.")
+            st.success("Fresh full DII scan complete." if restart_dii else "DII accumulation scan complete.")
         except Exception as exc:
             st.error(f"DII scan stopped before finalization: {exc}")
             saved_preview = load_saved_dii_preview()
@@ -746,7 +775,7 @@ with tabs[6]:
         "selected result period, then compares Sales, Operating Profit, Net Profit, and EPS with the previous "
         "quarter and the same quarter one year earlier."
     )
-    controls = st.columns([1.1, 1.4, 1, 1])
+    controls = st.columns([1.1, 1.4, 1, 1, 1])
     target_quarter = controls[0].text_input("Result quarter", value="Jun 2026", help="Use the quarter label shown by Screener.in, for example Jun 2026.")
     ranking_metric = controls[1].radio(
         "Rank by YoY growth",
@@ -754,18 +783,29 @@ with tabs[6]:
         horizontal=True,
     )
     run_quarterly = controls[2].button("Run / Resume Quarterly Scan", type="primary", use_container_width=True)
-    recover_quarterly = controls[3].button("Use Saved Quarterly Scan", use_container_width=True)
+    restart_quarterly = controls[3].button(
+        "Run Full Scan From Beginning",
+        key="restart_quarterly_scan",
+        use_container_width=True,
+    )
+    recover_quarterly = controls[4].button("Use Saved Quarterly Scan", use_container_width=True)
 
-    if run_quarterly:
+    if run_quarterly or restart_quarterly:
         quarterly_progress = make_progress("Scraping Screener.in quarterly results")
         try:
+            if restart_quarterly:
+                reset_quarterly_results_scan(target_quarter, output_dir=OUTPUT_DIR)
+                st.session_state.pop("quarterly_results", None)
             st.session_state["quarterly_results"] = run_quarterly_results_screen(
                 csv_path,
                 target_period=target_quarter,
                 progress_callback=quarterly_progress,
                 output_dir=OUTPUT_DIR,
             )
-            st.success("Quarterly-results scan complete.")
+            if restart_quarterly:
+                st.success("Fresh full-universe quarterly-results scan complete.")
+            else:
+                st.success("Quarterly-results scan complete.")
         except Exception as exc:
             st.error(f"Quarterly-results scan stopped before finalization: {exc}")
             saved_preview = load_saved_quarterly_preview(target_quarter)
@@ -918,7 +958,7 @@ with tabs[7]:
 
     st.markdown("**1. Download Or Resume NSE EOD Data**")
     default_derivatives_end = date.today() - timedelta(days=1)
-    download_controls = st.columns([1, 1, 1.25, 1])
+    download_controls = st.columns([1, 1, 1.25, 1.25, 1])
     derivatives_start = download_controls[0].date_input(
         "Download start",
         value=default_derivatives_end - timedelta(days=45),
@@ -935,17 +975,29 @@ with tabs[7]:
         type="primary",
         use_container_width=True,
     )
-    recover_derivatives = download_controls[3].button(
+    restart_derivatives = download_controls[3].button(
+        "Run Full Scan From Beginning",
+        key="restart_derivatives_download",
+        use_container_width=True,
+    )
+    recover_derivatives = download_controls[4].button(
         "Use Saved Derivatives Run",
         use_container_width=True,
     )
 
-    if download_derivatives:
+    if download_derivatives or restart_derivatives:
         if derivatives_start > derivatives_end:
             st.error("Download start must be on or before download end.")
         else:
             derivatives_download_progress = make_progress("Downloading official NSE reports by date")
             try:
+                if restart_derivatives:
+                    reset_derivatives_eod_data(
+                        derivatives_start,
+                        derivatives_end,
+                        output_dir=OUTPUT_DIR,
+                    )
+                    st.session_state.pop("derivatives_results", None)
                 health = download_derivatives_eod_data(
                     derivatives_start,
                     derivatives_end,
@@ -958,7 +1010,8 @@ with tabs[7]:
                 completed_dates = int(
                     health.get("Status", pd.Series(dtype=str)).astype(str).str.lower().isin(["downloaded", "cached"]).sum()
                 )
-                st.success(f"NSE EOD cache updated. {completed_dates:,} requested dates are available.")
+                prefix = "Fresh NSE EOD range downloaded." if restart_derivatives else "NSE EOD cache updated."
+                st.success(f"{prefix} {completed_dates:,} requested dates are available.")
             except Exception as exc:
                 st.error(f"NSE EOD download stopped: {exc}. Completed dates remain cached and can be resumed.")
 
@@ -1383,3 +1436,349 @@ with tabs[8]:
             else:
                 st.dataframe(sector_health, use_container_width=True, hide_index=True)
                 show_download("Download sector data health", sector_health, "sector_rotation_health.csv")
+
+
+with tabs[9]:
+    st.subheader("Macro Factor Correlation")
+    st.caption(
+        "Historical stock-return relationships with crude oil, gold, sovereign yields, and USD/INR. "
+        "Price factors use percentage changes; yields use basis-point changes."
+    )
+
+    selected_correlation_factors = st.multiselect(
+        "Factors",
+        options=list(FACTOR_CATALOG),
+        default=list(FACTOR_CATALOG),
+        key="correlation_factors_selection",
+    )
+    correlation_controls = st.columns(5)
+    correlation_end_date = correlation_controls[0].date_input(
+        "Analysis end date",
+        value=date.today() - timedelta(days=1),
+        max_value=date.today(),
+        key="correlation_end_date",
+    )
+    correlation_lookback = correlation_controls[1].slider(
+        "Lookback (years)",
+        min_value=1,
+        max_value=10,
+        value=3,
+        key="correlation_lookback",
+    )
+    correlation_frequency = correlation_controls[2].selectbox(
+        "Return frequency",
+        options=["Daily", "Weekly", "Monthly"],
+        index=1,
+        key="correlation_frequency",
+    )
+    correlation_method = correlation_controls[3].selectbox(
+        "Method",
+        options=["Pearson", "Spearman"],
+        key="correlation_method",
+    )
+    correlation_relation = correlation_controls[4].selectbox(
+        "Relationship",
+        options=["Same period", "Next stock period"],
+        key="correlation_relation",
+    )
+
+    correlation_rules = st.columns(5)
+    correlation_min_observations = correlation_rules[0].number_input(
+        "Minimum observations",
+        min_value=10,
+        max_value=1000,
+        value=24,
+        step=5,
+        key="correlation_min_observations",
+    )
+    correlation_top_n = correlation_rules[1].slider(
+        "Stocks per direction",
+        min_value=3,
+        max_value=30,
+        value=10,
+        key="correlation_top_n",
+    )
+    correlation_ridge_alpha = correlation_rules[2].number_input(
+        "Ridge alpha",
+        min_value=0.0,
+        max_value=100.0,
+        value=1.0,
+        step=0.5,
+        key="correlation_ridge_alpha",
+    )
+    run_correlation = correlation_rules[3].button(
+        "Run Correlation Scan",
+        type="primary",
+        use_container_width=True,
+    )
+    use_saved_correlation = correlation_rules[4].button(
+        "Use Saved Correlation",
+        use_container_width=True,
+    )
+
+    if run_correlation:
+        if not selected_correlation_factors:
+            st.error("Select at least one macro factor.")
+        else:
+            correlation_progress = make_progress("Downloading as-of market history and calculating relationships")
+            try:
+                st.session_state["correlation_results"] = run_correlation_screen(
+                    ticker_csv=csv_path,
+                    factors=selected_correlation_factors,
+                    end_date=correlation_end_date,
+                    lookback_years=int(correlation_lookback),
+                    frequency=correlation_frequency,
+                    method=correlation_method,
+                    relation=correlation_relation,
+                    min_observations=int(correlation_min_observations),
+                    top_n=int(correlation_top_n),
+                    ridge_alpha=float(correlation_ridge_alpha),
+                    progress_callback=correlation_progress,
+                    output_dir=OUTPUT_DIR,
+                )
+                st.success("Full-universe correlation scan and saved-run checkpoint are ready.")
+            except Exception as exc:
+                st.error(f"Correlation scan could not complete: {exc}")
+
+    if use_saved_correlation:
+        try:
+            st.session_state["correlation_results"] = load_saved_correlation(OUTPUT_DIR)
+            st.success("Loaded the saved prices, factors, correlation results, and ridge model.")
+        except FileNotFoundError as exc:
+            st.error(str(exc))
+
+    correlation_results = st.session_state.get("correlation_results", {})
+    correlation_all = correlation_results.get("results", pd.DataFrame()).copy()
+    correlation_factors = correlation_results.get("factors", pd.DataFrame()).copy()
+    correlation_health = correlation_results.get("health", pd.DataFrame()).copy()
+    correlation_stock_health = correlation_results.get("stock_health", pd.DataFrame()).copy()
+    correlation_prices = correlation_results.get("prices", pd.DataFrame()).copy()
+    correlation_metadata = correlation_results.get("metadata", pd.DataFrame()).copy()
+    correlation_stale = bool(correlation_results.get("stale", False))
+
+    if correlation_all.empty:
+        st.info("Run the full-universe scan or recover a completed correlation run.")
+    else:
+        available_factors = correlation_all["Factor"].dropna().astype(str).unique().tolist()
+        if correlation_stale:
+            latest_data_date = correlation_all.get("Data End", pd.Series(["unknown"])).max()
+            st.warning(f"Saved correlation results are being shown through {latest_data_date}.")
+        if not correlation_metadata.empty:
+            saved_row = correlation_metadata.iloc[0]
+            st.caption(
+                f"Saved run: {saved_row.get('Saved At UTC', 'unknown')} | "
+                f"{saved_row.get('Requested Frequency', 'unknown')} | "
+                f"{saved_row.get('Relationship', 'unknown')} | "
+                f"Ridge alpha {saved_row.get('Ridge Alpha', 'unknown')}"
+            )
+
+        summary_columns = st.columns(4)
+        summary_columns[0].metric("Stocks Analyzed", f"{correlation_all['Ticker'].nunique():,}")
+        summary_columns[1].metric("Factors Available", f"{len(available_factors):,}")
+        summary_columns[2].metric(
+            "Stock-Factor Pairs",
+            f"{len(correlation_all):,}",
+        )
+        summary_columns[3].metric(
+            "Latest Data Date",
+            str(correlation_all.get("Data End", pd.Series(["NA"])).max()),
+        )
+
+        display_factor = st.selectbox(
+            "Factor to inspect",
+            options=available_factors,
+            key="correlation_display_factor",
+        )
+        ranking_basis = st.segmented_control(
+            "Ranking model",
+            options=["Ridge Regression", "Correlation"],
+            default="Ridge Regression",
+            key="correlation_ranking_basis",
+        )
+        ranking_metric = "Ridge Coefficient" if ranking_basis == "Ridge Regression" else "Correlation"
+        if ranking_metric not in correlation_all.columns or correlation_all[ranking_metric].notna().sum() == 0:
+            ranking_metric = "Correlation"
+            if ranking_basis == "Ridge Regression":
+                st.warning("This in-memory run predates ridge regression. Load Saved Correlation to upgrade it without downloading again.")
+        current_results = correlation_all.loc[correlation_all["Factor"].eq(display_factor)].copy()
+        positive_all, inverse_all = select_relationship_leaders(
+            correlation_all,
+            top_n=int(correlation_top_n),
+            ranking_metric=ranking_metric,
+        )
+        positive_view = positive_all.loc[positive_all["Factor"].eq(display_factor)].copy()
+        inverse_view = inverse_all.loc[inverse_all["Factor"].eq(display_factor)].copy()
+
+        if display_factor == "India 10Y Yield" and correlation_frequency != "Monthly":
+            st.info(
+                "India 10Y uses the public FRED/OECD monthly series, so its effective frequency is Monthly. "
+                "Other factors use the frequency saved with this run."
+            )
+
+        chart_columns = st.columns(2)
+        if not positive_view.empty:
+            positive_chart = px.bar(
+                positive_view.sort_values(ranking_metric),
+                x=ranking_metric,
+                y="Ticker",
+                orientation="h",
+                color="Strong Rise Avg Return %",
+                color_continuous_scale="Greens",
+                hover_data=[
+                    "Name",
+                    "Industry",
+                    "Avg Return When Factor Rises %",
+                    "Positive Hit Rate When Factor Rises %",
+                    "Correlation",
+                    "Ridge Coefficient",
+                    "Observations",
+                ],
+                title=f"Rises With {display_factor} ({ranking_basis})",
+            )
+            positive_chart.update_layout(height=max(390, len(positive_view) * 32 + 120))
+            chart_columns[0].plotly_chart(positive_chart, use_container_width=True)
+        else:
+            chart_columns[0].info("No positive relationships met the observation requirement.")
+
+        if not inverse_view.empty:
+            inverse_chart = px.bar(
+                inverse_view.sort_values(ranking_metric, ascending=False),
+                x=ranking_metric,
+                y="Ticker",
+                orientation="h",
+                color="Strong Fall Avg Return %",
+                color_continuous_scale="Blues",
+                hover_data=[
+                    "Name",
+                    "Industry",
+                    "Avg Return When Factor Falls %",
+                    "Positive Hit Rate When Factor Falls %",
+                    "Correlation",
+                    "Ridge Coefficient",
+                    "Observations",
+                ],
+                title=f"Benefits When {display_factor} Falls ({ranking_basis})",
+            )
+            inverse_chart.update_layout(height=max(390, len(inverse_view) * 32 + 120))
+            chart_columns[1].plotly_chart(inverse_chart, use_container_width=True)
+        else:
+            chart_columns[1].info("No inverse relationships met the observation requirement.")
+
+        comparison_columns = st.columns(2)
+        positive_performance = normalized_factor_stock_performance(
+            correlation_prices,
+            correlation_factors,
+            display_factor,
+            positive_view.head(5).get("Ticker", pd.Series(dtype=str)).astype(str).tolist(),
+        )
+        if positive_performance.empty:
+            comparison_columns[0].info("Saved stock prices are required for the positive top-five comparison chart.")
+        else:
+            positive_lines = px.line(
+                positive_performance,
+                x="Date",
+                y="Normalized Value",
+                color="Series",
+                line_dash="Type",
+                title=f"{display_factor} And Top 5 Positive Picks (Start = 100)",
+            )
+            positive_lines.add_hline(y=100, line_width=1, line_dash="dot", line_color="#777777")
+            comparison_columns[0].plotly_chart(positive_lines, use_container_width=True)
+
+        inverse_performance = normalized_factor_stock_performance(
+            correlation_prices,
+            correlation_factors,
+            display_factor,
+            inverse_view.head(5).get("Ticker", pd.Series(dtype=str)).astype(str).tolist(),
+        )
+        if inverse_performance.empty:
+            comparison_columns[1].info("Saved stock prices are required for the inverse top-five comparison chart.")
+        else:
+            inverse_lines = px.line(
+                inverse_performance,
+                x="Date",
+                y="Normalized Value",
+                color="Series",
+                line_dash="Type",
+                title=f"{display_factor} And Top 5 Inverse Picks (Start = 100)",
+            )
+            inverse_lines.add_hline(y=100, line_width=1, line_dash="dot", line_color="#777777")
+            comparison_columns[1].plotly_chart(inverse_lines, use_container_width=True)
+        st.caption(
+            "Comparison lines use the common available window and normalize every series to 100. "
+            "Ridge coefficients are standardized partial relationships after controlling for the other factors at the same frequency."
+        )
+
+        matrix = correlation_matrix(correlation_all, stocks_per_factor=5)
+        if not matrix.empty:
+            correlation_heatmap = px.imshow(
+                matrix,
+                color_continuous_scale="RdBu",
+                color_continuous_midpoint=0,
+                zmin=-1,
+                zmax=1,
+                aspect="auto",
+                labels={"color": "Correlation"},
+                title="Cross-Factor Correlation Matrix For Leading And Inverse Stocks",
+            )
+            correlation_heatmap.update_layout(height=max(460, 22 * len(matrix) + 150))
+            st.plotly_chart(correlation_heatmap, use_container_width=True)
+
+        direction_tabs = st.tabs(["Factor Rises", "Factor Falls", "All Relationships", "Factor History", "Data Health"])
+        with direction_tabs[0]:
+            st.dataframe(format_percent_columns(positive_view), use_container_width=True, hide_index=True)
+            show_download(
+                f"Download stocks that rise with {display_factor}",
+                positive_view,
+                f"{display_factor.lower().replace('/', '_').replace(' ', '_')}_positive.csv",
+            )
+        with direction_tabs[1]:
+            st.dataframe(format_percent_columns(inverse_view), use_container_width=True, hide_index=True)
+            show_download(
+                f"Download stocks that benefit when {display_factor} falls",
+                inverse_view,
+                f"{display_factor.lower().replace('/', '_').replace(' ', '_')}_inverse.csv",
+            )
+        with direction_tabs[2]:
+            st.dataframe(format_percent_columns(current_results), use_container_width=True, hide_index=True)
+            show_download("Download all stock-factor relationships", correlation_all, "correlation_all.csv")
+        with direction_tabs[3]:
+            factor_history_view = correlation_factors.loc[
+                correlation_factors.get("Factor", pd.Series(dtype=str)).eq(display_factor)
+            ].copy()
+            if factor_history_view.empty:
+                st.info("No saved factor history is available for this factor.")
+            else:
+                factor_history_view["Date"] = pd.to_datetime(factor_history_view["Date"], errors="coerce")
+                history_chart = px.line(
+                    factor_history_view.dropna(subset=["Date"]),
+                    x="Date",
+                    y="Level",
+                    title=f"{display_factor} Historical Level",
+                )
+                st.plotly_chart(history_chart, use_container_width=True)
+                st.dataframe(factor_history_view, use_container_width=True, hide_index=True)
+        with direction_tabs[4]:
+            st.markdown("**Macro Factor Sources**")
+            st.dataframe(correlation_health, use_container_width=True, hide_index=True)
+            show_download("Download correlation data health", correlation_health, "correlation_health.csv")
+            st.markdown("**Stock Price Sources**")
+            if correlation_stock_health.empty:
+                st.info("No per-stock source report was saved for this run.")
+            else:
+                source_counts = (
+                    correlation_stock_health["Price Source"].value_counts().rename_axis("Price Source").reset_index(name="Stocks")
+                )
+                st.dataframe(source_counts, use_container_width=True, hide_index=True)
+                with st.expander("Inspect all stock price sources"):
+                    st.dataframe(correlation_stock_health, use_container_width=True, hide_index=True)
+                show_download(
+                    "Download stock price source health",
+                    correlation_stock_health,
+                    "correlation_stock_health.csv",
+                )
+
+        st.caption(
+            "Correlation describes historical co-movement, not causation or a guaranteed future reaction. "
+            "Same-period results are contemporaneous; Next stock period compares a factor move with the following stock-return period."
+        )

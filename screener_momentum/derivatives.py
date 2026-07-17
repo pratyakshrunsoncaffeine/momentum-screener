@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import io
+import shutil
 import time
 import zipfile
 from collections.abc import Callable, Iterable
@@ -173,6 +174,34 @@ class NseEodDerivativesProvider:
                 except ValueError:
                     continue
         return sorted(dates)
+
+    def reset_range(self, start_date: date, end_date: date) -> int:
+        """Remove cached raw and normalized reports only inside one requested date range."""
+        if start_date > end_date:
+            raise ValueError("Derivatives data start date must be on or before the end date.")
+        removed = 0
+        for trade_date in (item.date() for item in pd.date_range(start_date, end_date, freq="D")):
+            day_name = trade_date.strftime("%Y%m%d")
+            for parent in (self.raw_dir, self.normalized_dir):
+                target = parent / day_name
+                if not target.exists():
+                    continue
+                parent_resolved = parent.resolve()
+                target_resolved = target.resolve()
+                if target_resolved.parent != parent_resolved:
+                    raise RuntimeError(f"Refusing to remove cache path outside {parent_resolved}.")
+                shutil.rmtree(target_resolved)
+                removed += 1
+
+        manifest = self._load_manifest()
+        if not manifest.empty and "Trade Date" in manifest.columns:
+            report_dates = pd.to_datetime(manifest["Trade Date"], errors="coerce").dt.date
+            remaining = manifest.loc[~report_dates.between(start_date, end_date)].copy()
+            if remaining.empty:
+                self.manifest_path.unlink(missing_ok=True)
+            else:
+                self._save_manifest(remaining)
+        return removed
 
     def load_date(self, trade_date: date) -> DailyDerivativesData:
         if not self._is_cached(trade_date):

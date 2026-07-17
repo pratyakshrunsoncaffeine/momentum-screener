@@ -74,6 +74,13 @@ The `Quarterly Results` tab scans every ticker in `ticker.csv` using the existin
 - QoQ: selected result quarter versus the immediately preceding quarter, for example `Jun 2026` versus `Mar 2026`.
 - YoY: selected result quarter versus the same quarter one year earlier, for example `Jun 2026` versus `Jun 2025`.
 
+`Run / Resume Quarterly Scan` retains successful checkpoint rows and continues interrupted work, while retrying saved network failures. `Run Full Scan From Beginning` clears only the quarterly-results and post-earnings checkpoints, then scrapes the complete ticker universe again from ticker one. Use the full restart after Screener.in has updated more company results for the same quarter.
+
+The same restart pattern is available wherever a resumable full scan exists:
+
+- FII and DII full restart buttons clear only their respective institutional checkpoints and derived rankings.
+- The derivatives full-range restart clears raw and normalized NSE EOD cache directories only for the selected date range, preserves cached dates outside that range, and rebuilds derived signal and backtest files.
+
 Use the `Rank by YoY growth` control to sort the results by Sales, Operating Profit, Net Profit, or EPS without running the scrape again. The full scan and the matching-quarter subset are saved separately, and checkpoints resume only when they belong to the same requested quarter.
 
 - `output/latest/quarterly_results_partial.csv`
@@ -140,6 +147,44 @@ Saved sector files:
 - `output/latest/sector_rotation_prices.csv`
 - `output/latest/sector_rotation_snapshot.csv`
 - `output/latest/sector_rotation_health.csv`
+
+## Macro Factor Correlation
+
+The `Correlation` tab scans the complete `ticker.csv` universe against Brent crude, gold, the US 10-year yield, the India 10-year yield, and USD/INR. Every fresh run downloads stock history only through the selected analysis date, so a later run automatically rolls the historical window forward without using dates after the requested cutoff.
+
+Brent, gold, and USD/INR use percentage price changes. Sovereign yields use basis-point changes because percentage returns on yield levels are not economically comparable. The public India 10-year FRED/OECD series is monthly; the dashboard labels that effective frequency even when the other selected factors use daily or weekly observations.
+
+Stock history is requested from Yahoo Finance using each ticker with `.NS` appended. Failed Yahoo batches are retried in smaller groups. Symbols that remain unavailable are attempted through official NSE equity history and are identified in the source-health export. Yahoo closes are corporate-action adjusted; the NSE fallback is a raw close, so its different price basis is disclosed rather than silently blended.
+
+For each factor, the tab shows:
+
+- Stocks with the strongest positive historical relationship.
+- Stocks with the strongest inverse relationship, which have tended to benefit when the factor fell.
+- Average stock returns and positive-return hit rates when the factor rose or fell.
+- Strong-move tail returns, sensitivity, R-squared, and observation counts.
+- A cross-factor correlation heatmap, detailed table, factor history, and source-health report.
+- Standardized multivariate ridge coefficients that isolate each factor's partial relationship after controlling for the other factors available at the same frequency.
+- Normalized factor-versus-stock charts for the five strongest positive and inverse picks.
+
+`Same period` measures contemporaneous co-movement. `Next stock period` compares each factor change with the following stock-return period and is the more relevant research view for a watchlist, but it remains a historical relationship rather than a prediction or guarantee.
+
+Use the `Ranking model` control to switch the top picks between raw correlation and ridge regression. Ridge is the default because crude, gold, yields, and currencies can move together; regularization makes the partial coefficients less unstable than an unpenalized multivariate regression. `Ridge alpha` controls the penalty and is saved with the run.
+
+`Use Saved Correlation` reloads the complete research state, including the stock-price matrix, factor observations, model outputs, settings, and source-health reports. This is sufficient to redraw the comparison charts without downloading Yahoo or NSE data again.
+
+Saved correlation files:
+
+- `output/correlation_cache/` for macro source-level checkpoints.
+- `output/latest/correlation_stock_prices.csv`
+- `output/latest/correlation_factors.csv`
+- `output/latest/correlation_all.csv`
+- `output/latest/correlation_top_positive.csv`
+- `output/latest/correlation_top_negative.csv`
+- `output/latest/correlation_health.csv`
+- `output/latest/correlation_stock_health.csv`
+- `output/latest/correlation_ridge_top_positive.csv`
+- `output/latest/correlation_ridge_top_negative.csv`
+- `output/latest/correlation_run_metadata.csv`
 
 ## Local Setup
 

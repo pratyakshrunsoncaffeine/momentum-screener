@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from datetime import date, timedelta
+from pathlib import Path
+from tempfile import gettempdir
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
 from .config import RETURN_PERIODS
+
+
+_YFINANCE_CACHE = Path(gettempdir()) / "momentum_screener_yfinance_cache"
+_YFINANCE_CACHE.mkdir(parents=True, exist_ok=True)
+yf.set_tz_cache_location(str(_YFINANCE_CACHE))
 
 
 def chunked(values: list[str], size: int) -> Iterable[list[str]]:
@@ -18,6 +26,8 @@ def download_adjusted_close(
     yahoo_tickers: list[str],
     batch_size: int = 80,
     period: str = "6y",
+    start_date: date | None = None,
+    end_date: date | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> pd.DataFrame:
     """Download adjusted close series in batches and return one column per ticker."""
@@ -27,14 +37,21 @@ def download_adjusted_close(
     for batch in chunked(yahoo_tickers, batch_size):
         if progress_callback:
             progress_callback(completed, total, f"Downloading prices for {batch[0]} to {batch[-1]}")
-        data = yf.download(
-            tickers=batch,
-            period=period,
-            auto_adjust=True,
-            group_by="ticker",
-            threads=True,
-            progress=False,
-        )
+        download_options: dict[str, object] = {
+            "tickers": batch,
+            "auto_adjust": True,
+            "group_by": "ticker",
+            "threads": True,
+            "progress": False,
+        }
+        if start_date is not None or end_date is not None:
+            if start_date is not None:
+                download_options["start"] = start_date.isoformat()
+            if end_date is not None:
+                download_options["end"] = (end_date + timedelta(days=1)).isoformat()
+        else:
+            download_options["period"] = period
+        data = yf.download(**download_options)
         close = _extract_close(data, batch)
         if not close.empty:
             closes.append(close)
