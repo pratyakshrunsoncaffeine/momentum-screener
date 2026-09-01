@@ -9,3 +9,4 @@ output*/
 .streamlit_app.log
 .streamlit_app.err
 .streamlit/secrets.toml
+upload_github/

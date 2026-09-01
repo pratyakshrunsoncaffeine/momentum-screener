@@ -38,7 +38,7 @@ def main() -> None:
 
     for name, frame in results.items():
         if frame is not None and not frame.empty:
-            frame.to_csv(output_dir / f"{name}.csv", index=name == "backtest")
+            frame.to_csv(output_dir / f"{name}.csv", index=name in {"backtest", "normalized_backtest"})
 
     print(f"Momentum rows: {len(results['momentum'])}")
     print(f"Final rows: {len(results['final'])}")
