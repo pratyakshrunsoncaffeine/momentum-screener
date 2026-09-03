@@ -1,0 +1,58 @@
+name: News Catalysts - Monthly Retraining
+
+on:
+  schedule:
+    - cron: "15 17 1 * *"
+      timezone: "Asia/Kolkata"
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Existing Supabase job ID (optional)
+        required: false
+        type: string
+      as_of_date:
+        description: Retraining cutoff in YYYY-MM-DD format
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: news-catalysts-retrain
+  cancel-in-progress: false
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_DB_HOST: ${{ secrets.SUPABASE_DB_HOST }}
+      SUPABASE_DB_USER: ${{ secrets.SUPABASE_DB_USER }}
+      SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+      SUPABASE_DB_NAME: ${{ secrets.SUPABASE_DB_NAME }}
+      SUPABASE_NEWS_BUCKET: news-models
+      TOKENIZERS_PARALLELISM: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install research worker dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements-ml.txt
+      - name: Resolve run date
+        id: run_date
+        shell: bash
+        run: |
+          RUN_DATE="${{ inputs.as_of_date }}"
+          if [ -z "$RUN_DATE" ]; then RUN_DATE="$(TZ=Asia/Kolkata date +%F)"; fi
+          echo "value=$RUN_DATE" >> "$GITHUB_OUTPUT"
+      - name: Retrain champion and challenger models
+        run: >-
+          python -m screener_momentum.news_worker
+          --job-type retrain
+          --job-id "${{ inputs.job_id }}"
+          --as-of-date "${{ steps.run_date.outputs.value }}"

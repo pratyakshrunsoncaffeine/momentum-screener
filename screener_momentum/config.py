@@ -119,33 +119,6 @@ class Sma200ScanConfig:
 
 
 @dataclass(frozen=True)
-class DerivativesSignalConfig:
-    min_underlying_return_pct: float = 2.0
-    min_call_return_pct: float = 8.0
-    min_call_price: float = 5.0
-    min_volume_contracts: int = 100
-    min_open_interest_contracts: int = 100
-    min_days_to_expiry: int = 7
-    max_days_to_expiry: int = 45
-    corporate_action_return_pct: float = 20.0
-    result_count: int = 100
-    call_return_weight: float = 0.35
-    underlying_return_weight: float = 0.25
-    call_oi_change_weight: float = 0.15
-    call_volume_ratio_weight: float = 0.15
-    futures_return_weight: float = 0.10
-
-    def score_weights(self) -> dict[str, float]:
-        return {
-            "Call Return %": self.call_return_weight,
-            "Underlying Return %": self.underlying_return_weight,
-            "Call OI Change %": self.call_oi_change_weight,
-            "Call Volume Ratio": self.call_volume_ratio_weight,
-            "Futures Return %": self.futures_return_weight,
-        }
-
-
-@dataclass(frozen=True)
 class ScreeningConfig:
     momentum_weights: dict[str, float] = field(default_factory=lambda: DEFAULT_MOMENTUM_WEIGHTS.copy())
     positive_return_filters: tuple[str, ...] = DEFAULT_POSITIVE_RETURN_FILTERS

@@ -9,7 +9,7 @@ This project screens NSE stocks from `ticker.csv` in four stages:
 
 The dashboard also backtests a portfolio invested in the top 10 final companies: 70% split across the top 5 and 30% split across the next 5, compared against Nifty 50 and a Nifty Midcap benchmark where Yahoo Finance data is available.
 
-It also includes independent FII, DII, quarterly-results, post-earnings stock-return, NSE derivatives momentum, NSE index momentum, uploaded-stock momentum, macro correlation, and 200DMA opportunity workflows. Each long-running scanner writes checkpoints so a Streamlit refresh does not discard completed work.
+It also includes independent FII, DII, quarterly-results, post-earnings stock-return, NSE index momentum, uploaded-stock momentum, macro correlation, and 200DMA opportunity workflows. Each long-running scanner writes checkpoints so a Streamlit refresh does not discard completed work.
 
 The portfolio tab uses a monthly walk-forward price backtest. Each month it recalculates momentum using only price data available before that rebalance date, invests for one month, then reinvests the ending capital into the next month's selected portfolio. If fundamentals are applied, the historical backtest uses the current fundamentals-passed universe as a static filter, so it avoids price lookahead but still has current-fundamentals bias.
 
@@ -76,10 +76,7 @@ The `Quarterly Results` tab scans every ticker in `ticker.csv` using the existin
 
 `Run / Resume Quarterly Scan` retains successful checkpoint rows and continues interrupted work, while retrying saved network failures. `Run Full Scan From Beginning` clears only the quarterly-results and post-earnings checkpoints, then scrapes the complete ticker universe again from ticker one. Use the full restart after Screener.in has updated more company results for the same quarter.
 
-The same restart pattern is available wherever a resumable full scan exists:
-
-- FII and DII full restart buttons clear only their respective institutional checkpoints and derived rankings.
-- The derivatives full-range restart clears raw and normalized NSE EOD cache directories only for the selected date range, preserves cached dates outside that range, and rebuilds derived signal and backtest files.
+The same restart pattern is available for the FII and DII full restart buttons, which clear only their respective institutional checkpoints and derived rankings.
 
 Use the `Rank by YoY growth` control to sort the results by Sales, Operating Profit, Net Profit, or EPS without running the scrape again. The full scan and the matching-quarter subset are saved separately, and checkpoints resume only when they belong to the same requested quarter.
 
@@ -96,46 +93,40 @@ The default weights are 20% for 2 days, 30% for 5 days, and 50% for 10 days. The
 - `output/latest/quarterly_stock_return_returns.csv`
 - `output/latest/quarterly_stock_return_momentum.csv`
 
-## Derivatives Momentum Scanner
-
-The `Derivatives Momentum` tab uses official end-of-day NSE cash-market, F&O bhavcopy, and F&O contract reports. It intersects each date's stock F&O universe with all tickers in `ticker.csv`; companies without listed derivatives are retained in the export with `No listed derivatives` status.
-
-A default options-confirmed equity signal requires all of the following on the same trading day:
-
-- Underlying stock return of at least 2%.
-- Selected near-ATM call return of at least 8%. The 8% threshold is a hard minimum; larger gains remain eligible and rank higher.
-- Call close of at least Rs. 5.
-- Call volume and open interest of at least 100 contracts each.
-- A monthly stock-option expiry between 7 and 45 calendar days away.
-- Valid current and previous closes with no detected corporate-action distortion.
-
-The signal recommends buying the underlying equity, not the call. Qualifying stocks are ranked by call return, stock return, call OI change, call volume versus its 20-day median, and near-month futures return. Rising call OI is a ranking input rather than a hard bullish rule because it can represent buying or writing. Futures activity is separately labelled as long build-up, short covering, short build-up, long unwinding, or unconfirmed.
-
-Use the tab in this order:
-
-1. Select a date range and click `Download / Resume EOD Data`. Raw reports and normalized daily CSVs are cached by trade date.
-2. Choose a cached signal date and click `Run Options-Confirmed Momentum`.
-3. Review ranked signals, rejection reasons, the complete F&O eligibility map, and report health.
-4. For validation, first backfill the historical range, then run the chronological event study and portfolio simulation.
-
-The backtest enters the stock at the next trading day's open, measures 1, 3, 5, and 10-day forward returns, deducts the configured round-trip cost, and compares stock-only, stock-plus-call, full derivatives, regular momentum, and Nifty 50 results. Events are split chronologically into 60% Train, 20% Validation, and 20% untouched Test periods. A useful strategy should improve the full derivatives Test result over the stock-only baseline after costs, not merely look attractive in training.
-
-Saved derivatives files:
-
-- `output/derivatives_cache/` for raw and normalized daily NSE reports.
-- `output/latest/derivatives_contracts.csv`
-- `output/latest/derivatives_daily_features.csv`
-- `output/latest/derivatives_signals.csv`
-- `output/latest/derivatives_rejections.csv`
-- `output/latest/derivatives_data_health.csv`
-- `output/latest/derivatives_backtest_events.csv`
-- `output/latest/derivatives_backtest_curve.csv`
-- `output/latest/derivatives_backtest_summary.csv`
-- `output/latest/derivatives_event_summary.csv`
-
 ## NSE Index Momentum
 
 The `Index Momentum` tab uses the complete 128-index catalogue supplied from NSE, covering derivatives-eligible, broad-market, sectoral, strategy, and thematic indices. It downloads official daily index closes from NSE Indices and ranks each available index independently, so a newer index does not force every other index onto a shorter common date range.
+
+## News Catalysts
+
+The `News Catalysts` tab is an after-close research system for 5-day, 1-month, and 3-month NSE index forecasts. It combines point-in-time news, official NSE index closes, dated constituent activity, and the existing index momentum features. The dashboard queues background jobs and always keeps the last successful prediction available if a later job fails.
+
+The data and model stack is deliberately separated from the Streamlit process:
+
+- Filtered five-year GDELT backfills run through the no-card BigQuery Sandbox. Every UTC date is dry-run first, capped at 5 GiB, adaptively sampled when necessary, and checkpointed in Supabase before the next date begins. Incremental runs use GDELT plus explicitly configured, permitted publisher RSS feeds with a 48-hour overlap.
+- Supabase PostgreSQL stores articles, dated index attribution, constituents, prices, features, labels, jobs, model versions, predictions, and catalysts. `pgvector` stores sentence embeddings; private Supabase Object Storage stores Parquet partitions and model artifacts.
+- SQLMesh builds incremental point-in-time news features and forward labels. News after 4:30 PM IST is assigned to the next trading session.
+- FinBERT produces sentiment when headline text is available. GDELT tone fallback is labelled explicitly for metadata-only records.
+- Pooled LightGBM regressors/classifiers are ensembled with Ridge. A price-only LightGBM model is the mandatory benchmark.
+- Saved catalyst headlines are paired with SHAP feature contributions for the selected horizon.
+- Winsorization, empirical-Bayes sentiment shrinkage, embedding compression, minimum source/article features, and exponentially weighted aggregation reduce noise.
+- Training-only headline dropout, embedding noise, source masking, relevance jitter, and technical-feature jitter are enabled only if the validation ablation improves. Dates, labels, index identities, split boundaries, and constituent effective dates are never altered.
+- Training uses chronological 60%/20%/20% partitions with a 63-trading-day embargo. A model remains `Experimental` unless its untouched-test rank IC is positive and beats the price-only baseline on at least two horizons.
+
+Pulse by Zerodha is not scraped or reverse-engineered. The dashboard provides only a manual Pulse link; an automated adapter remains disabled unless Zerodha supplies an authorized interface.
+
+### News Setup
+
+1. Create a Supabase project and run [`supabase/news_schema.sql`](supabase/news_schema.sql) in its SQL editor.
+2. Create a Google Cloud project without linking billing. Open BigQuery once to activate Sandbox, then create a service account with `BigQuery Job User` and `BigQuery Read Session User` roles.
+3. Add these GitHub repository secrets: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_DB_HOST`, `SUPABASE_DB_USER`, `SUPABASE_DB_PASSWORD`, `SUPABASE_DB_NAME`, `GOOGLE_CLOUD_PROJECT`, and `GOOGLE_CLOUD_SERVICE_ACCOUNT_JSON`. The worker intentionally constructs its database connection from these fields so the password is not duplicated inside a URL secret.
+4. Optionally add `NEWS_RSS_FEEDS_JSON` as a JSON object containing only feeds whose terms permit automated retrieval.
+5. Add the values from [`.streamlit/secrets.toml.example`](.streamlit/secrets.toml.example) to Streamlit Community Cloud secrets. Use a new fine-grained GitHub token limited to this repository with Actions write access.
+6. Run `News Catalysts - Historical Backfill` repeatedly until the job reports that all historical partitions are complete. Each run processes at most 90 pending dates and resumes from the durable Supabase ledger. Daily inference runs after 4:30 PM IST on weekdays; retraining runs monthly.
+
+The workflow reserves roughly 10% of Sandbox's monthly 1 TiB query allowance and never relies on `LIMIT` as a cost control. `LIMIT` restricts downloaded rows only; dry runs, partition pruning, adaptive `TABLESAMPLE`, and `maximum_bytes_billed` enforce the free boundary. If the 900 GiB guard is reached, the job moves to `waiting_for_resume` and can continue after the monthly quota resets. BigQuery stores no durable training corpus; Supabase holds the persistent data, so Sandbox's 60-day BigQuery table expiration does not affect saved history.
+
+Heavy worker packages are isolated in `requirements-ml.txt`; normal Streamlit deployment continues to use `requirements.txt`.
 
 The near-term default score is 10% for the 2-day return, 20% for 5 days, 25% for 10 days, 25% for 1 month, 15% for 2 months, and 5% for 3 months. All six weights are adjustable inside the tab and normalized automatically. The complete ranking remains visible, while `Short-Term Positive` identifies indices whose 2-day, 5-day, and 10-day returns are all positive.
 
@@ -248,7 +239,6 @@ Most screener knobs are in `screener_momentum/config.py`:
 - `DEFAULT_INDEX_MOMENTUM_WEIGHTS`
 - `FundamentalThresholds`
 - `Sma200ScanConfig`
-- `DerivativesSignalConfig`
 - `BENCHMARKS`
 
 The Streamlit sidebar also lets you adjust weights and filter thresholds without code edits.

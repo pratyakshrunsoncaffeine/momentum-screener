@@ -20,14 +20,11 @@ from .correlation import (
 from .config import (
     DEFAULT_POST_EARNINGS_STOCK_RETURN_WEIGHTS,
     POST_EARNINGS_STOCK_RETURN_PERIODS,
-    DerivativesSignalConfig,
     FundamentalThresholds,
     ScreeningConfig,
     Sma200ScanConfig,
     RETURN_PERIODS,
 )
-from .derivatives import NseEodDerivativesProvider, build_volume_history, scan_derivatives_momentum
-from .derivatives_backtest import derivatives_backtest, summarize_derivatives_curve, summarize_derivatives_events
 from .fundamentals import (
     normalize_quarter_period,
     screen_dii_holdings,
@@ -89,16 +86,6 @@ def output_paths(output_dir: str | Path = "output/latest") -> dict[str, Path]:
         "quarterly_results_matching": root / "quarterly_results_matching.csv",
         "quarterly_stock_return_returns": root / "quarterly_stock_return_returns.csv",
         "quarterly_stock_return_momentum": root / "quarterly_stock_return_momentum.csv",
-        "derivatives_cache": root.parent / "derivatives_cache",
-        "derivatives_contracts": root / "derivatives_contracts.csv",
-        "derivatives_daily_features": root / "derivatives_daily_features.csv",
-        "derivatives_signals": root / "derivatives_signals.csv",
-        "derivatives_rejections": root / "derivatives_rejections.csv",
-        "derivatives_data_health": root / "derivatives_data_health.csv",
-        "derivatives_backtest_events": root / "derivatives_backtest_events.csv",
-        "derivatives_backtest_curve": root / "derivatives_backtest_curve.csv",
-        "derivatives_backtest_summary": root / "derivatives_backtest_summary.csv",
-        "derivatives_event_summary": root / "derivatives_event_summary.csv",
         "sector_rotation_cache": root.parent / "sector_rotation_cache",
         "sector_rotation_prices": root / "sector_rotation_prices.csv",
         "sector_rotation_snapshot": root / "sector_rotation_snapshot.csv",
@@ -1125,159 +1112,6 @@ def run_momentum(
         output_dir=output_dir,
     )
     return score_and_save_momentum(returns, config, output_dir=output_dir)
-
-
-def download_derivatives_eod_data(
-    start_date: date,
-    end_date: date,
-    progress_callback: ProgressCallback | None = None,
-    output_dir: str | Path = "output/latest",
-) -> pd.DataFrame:
-    paths = output_paths(output_dir)
-    provider = NseEodDerivativesProvider(paths["derivatives_cache"])
-    health = provider.download_range(start_date, end_date, progress_callback=progress_callback)
-    save_frame(health, paths["derivatives_data_health"])
-    return health
-
-
-def reset_derivatives_eod_data(
-    start_date: date,
-    end_date: date,
-    output_dir: str | Path = "output/latest",
-) -> dict[str, object]:
-    """Clear a selected NSE EOD cache range and all derived derivatives outputs."""
-    if start_date > end_date:
-        raise ValueError("Derivatives data start date must be on or before the end date.")
-    paths = output_paths(output_dir)
-    provider = NseEodDerivativesProvider(paths["derivatives_cache"])
-    removed_cache_directories = provider.reset_range(start_date, end_date)
-    output_keys = (
-        "derivatives_contracts",
-        "derivatives_daily_features",
-        "derivatives_signals",
-        "derivatives_rejections",
-        "derivatives_data_health",
-        "derivatives_backtest_events",
-        "derivatives_backtest_curve",
-        "derivatives_backtest_summary",
-        "derivatives_event_summary",
-    )
-    removed_outputs = _remove_output_files(paths, output_keys)
-    return {
-        "removed_cache_directories": removed_cache_directories,
-        "removed_outputs": removed_outputs,
-    }
-
-
-def run_derivatives_momentum_screen(
-    csv_path: str,
-    config: DerivativesSignalConfig,
-    scan_date: date | None = None,
-    progress_callback: ProgressCallback | None = None,
-    output_dir: str | Path = "output/latest",
-) -> dict[str, pd.DataFrame]:
-    paths = output_paths(output_dir)
-    provider = NseEodDerivativesProvider(paths["derivatives_cache"])
-    available = [item for item in provider.available_dates() if scan_date is None or item <= scan_date]
-    if not available:
-        raise FileNotFoundError("No cached NSE derivatives dates are available. Download EOD data first.")
-    selected_date = max(available)
-    selected_index = available.index(selected_date)
-    daily = provider.load_date(selected_date)
-    previous = provider.load_date(available[selected_index - 1]).derivatives if selected_index > 0 else None
-    universe = load_ticker_universe(csv_path)
-
-    prior_frames: list[pd.DataFrame] = []
-    history_dates = available[max(0, selected_index - 20):selected_index]
-    for index, history_date in enumerate(history_dates, start=1):
-        if progress_callback:
-            progress_callback(index - 1, len(history_dates) + 1, f"Building option-volume history for {history_date}")
-        history_daily = provider.load_date(history_date)
-        history_previous = (
-            provider.load_date(available[available.index(history_date) - 1]).derivatives
-            if available.index(history_date) > 0
-            else None
-        )
-        history_scan = scan_derivatives_momentum(
-            universe,
-            history_daily,
-            config,
-            previous_derivatives=history_previous,
-            volume_history=build_volume_history(prior_frames[-20:]),
-        )
-        prior_frames.append(history_scan["features"])
-
-    results = scan_derivatives_momentum(
-        universe,
-        daily,
-        config,
-        previous_derivatives=previous,
-        volume_history=build_volume_history(prior_frames[-20:]),
-        progress_callback=progress_callback,
-    )
-    save_frame(results["contracts"], paths["derivatives_contracts"])
-    save_frame(results["features"], paths["derivatives_daily_features"])
-    save_frame(results["signals"], paths["derivatives_signals"])
-    save_frame(results["rejections"], paths["derivatives_rejections"])
-    results["data_health"] = _read_saved_frame(paths["derivatives_data_health"])
-    return results
-
-
-def run_derivatives_backtest_screen(
-    csv_path: str,
-    config: DerivativesSignalConfig,
-    start_date: date,
-    end_date: date,
-    holding_days: int = 5,
-    top_n: int = 10,
-    round_trip_cost_pct: float = 0.30,
-    progress_callback: ProgressCallback | None = None,
-    output_dir: str | Path = "output/latest",
-) -> dict[str, pd.DataFrame]:
-    paths = output_paths(output_dir)
-    provider = NseEodDerivativesProvider(paths["derivatives_cache"])
-    universe = load_ticker_universe(csv_path)
-    result = derivatives_backtest(
-        provider,
-        universe,
-        config,
-        start_date,
-        end_date,
-        holding_days=holding_days,
-        top_n=top_n,
-        round_trip_cost_pct=round_trip_cost_pct,
-        progress_callback=progress_callback,
-    )
-    nifty_prices = _download_nifty_prices(start_date, end_date)
-    events = _add_nifty_event_returns(result.events, nifty_prices)
-    curve = _add_nifty_benchmark(result.curve, start_date, end_date, prices=nifty_prices)
-    performance = summarize_derivatives_curve(curve, events)
-    event_summary = summarize_derivatives_events(events)
-    save_frame(events, paths["derivatives_backtest_events"])
-    save_frame(curve, paths["derivatives_backtest_curve"])
-    save_frame(performance, paths["derivatives_backtest_summary"])
-    save_frame(event_summary, paths["derivatives_event_summary"])
-    return {
-        "events": events,
-        "curve": curve,
-        "performance": performance,
-        "event_summary": event_summary,
-    }
-
-
-def load_saved_derivatives_results(output_dir: str | Path = "output/latest") -> dict[str, pd.DataFrame]:
-    paths = output_paths(output_dir)
-    return {
-        "contracts": _read_saved_frame(paths["derivatives_contracts"]),
-        "features": _read_saved_frame(paths["derivatives_daily_features"]),
-        "signals": _read_saved_frame(paths["derivatives_signals"]),
-        "rejections": _read_saved_frame(paths["derivatives_rejections"]),
-        "data_health": _read_saved_frame(paths["derivatives_data_health"]),
-        "events": _read_saved_frame(paths["derivatives_backtest_events"]),
-        "curve": _read_saved_frame(paths["derivatives_backtest_curve"]),
-        "performance": _read_saved_frame(paths["derivatives_backtest_summary"]),
-        "event_summary": _read_saved_frame(paths["derivatives_event_summary"]),
-    }
 
 
 def run_fii_momentum_screen(

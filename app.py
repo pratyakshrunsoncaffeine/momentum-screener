@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -19,7 +20,6 @@ from screener_momentum.config import (
     DEFAULT_POST_EARNINGS_STOCK_RETURN_WEIGHTS,
     DEFAULT_MOMENTUM_WEIGHTS,
     DEFAULT_POSITIVE_RETURN_FILTERS,
-    DerivativesSignalConfig,
     FundamentalThresholds,
     ScreeningConfig,
     Sma200ScanConfig,
@@ -30,8 +30,14 @@ from screener_momentum.index_momentum import (
     index_catalogue_frame,
     normalized_index_performance,
 )
+from screener_momentum.news_config import IST, after_news_cutoff
+from screener_momentum.news_pipeline import (
+    load_saved_news_results,
+    news_environment_status,
+    queue_news_workflow,
+    save_news_eligibility,
+)
 from screener_momentum.pipeline import (
-    download_derivatives_eod_data,
     finalize_dii_momentum_screen,
     finalize_fii_momentum_screen,
     finalize_quarterly_results_screen,
@@ -40,14 +46,11 @@ from screener_momentum.pipeline import (
     load_saved_index_momentum,
     load_saved_custom_stock_momentum,
     load_saved_returns,
-    load_saved_derivatives_results,
     output_paths,
     prepare_dii_all,
     prepare_fii_all,
     prepare_quarterly_results,
     run_dii_momentum_screen,
-    run_derivatives_backtest_screen,
-    run_derivatives_momentum_screen,
     run_fii_momentum_screen,
     run_fundamentals_screen,
     run_quarterly_results_screen,
@@ -59,7 +62,6 @@ from screener_momentum.pipeline import (
     run_custom_stock_momentum,
     run_sma200_screen,
     run_momentum,
-    reset_derivatives_eod_data,
     reset_dii_momentum_scan,
     reset_fii_momentum_scan,
     reset_quarterly_results_scan,
@@ -73,11 +75,293 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_TICKER_FILE = ROOT / "ticker.csv"
 OUTPUT_DIR = ROOT / "output" / "latest"
 
+NEWS_SECRET_KEYS = (
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "NEWS_GITHUB_ACTIONS_TOKEN",
+    "NEWS_GITHUB_REPOSITORY",
+    "NEWS_GITHUB_BRANCH",
+    "NEWS_ADMIN_PASSWORD",
+)
+
+
+def configure_news_secrets() -> None:
+    try:
+        secrets = st.secrets
+        for key in NEWS_SECRET_KEYS:
+            value = secrets.get(key)
+            if value and not os.getenv(key):
+                os.environ[key] = str(value)
+    except (FileNotFoundError, KeyError, AttributeError):
+        return
+
+
+def news_frame_column(frame: pd.DataFrame, *names: str) -> str | None:
+    lookup = {str(column).lower(): str(column) for column in frame.columns}
+    for name in names:
+        if name.lower() in lookup:
+            return lookup[name.lower()]
+    return None
+
+
+def load_news_dashboard_state() -> None:
+    st.session_state["news_results"] = load_saved_news_results(OUTPUT_DIR)
+
+
+@st.fragment(run_every="15s")
+def show_news_job_monitor() -> None:
+    results = load_saved_news_results(OUTPUT_DIR)
+    jobs = results.get("jobs", pd.DataFrame())
+    if jobs.empty:
+        st.caption("No background news job has been queued yet.")
+        return
+    requested = news_frame_column(jobs, "Requested At UTC")
+    if requested:
+        jobs = jobs.sort_values(requested, ascending=False)
+    latest = jobs.iloc[0]
+    status_column = news_frame_column(jobs, "Status")
+    completed_column = news_frame_column(jobs, "Completed")
+    total_column = news_frame_column(jobs, "Total")
+    message_column = news_frame_column(jobs, "Message")
+    status = str(latest.get(status_column, "unknown")) if status_column else "unknown"
+    completed_value = pd.to_numeric(latest.get(completed_column, 0), errors="coerce") if completed_column else 0
+    total_value = pd.to_numeric(latest.get(total_column, 0), errors="coerce") if total_column else 0
+    completed = 0 if pd.isna(completed_value) else int(completed_value)
+    total = 0 if pd.isna(total_value) else int(total_value)
+    st.caption(f"Latest background job: {status}")
+    if total > 0:
+        st.progress(min(completed / total, 1.0), text=f"{completed:,} of {total:,}")
+    if message_column and pd.notna(latest.get(message_column)):
+        st.caption(str(latest.get(message_column)))
+
 
 st.set_page_config(
     page_title="Momentum Screener",
     layout="wide",
 )
+
+configure_news_secrets()
+
+
+def render_news_catalysts() -> None:
+    st.subheader("News Catalysts")
+    st.caption(
+        "After-close NSE index forecasts from point-in-time India news, official index prices, and constituent activity. Predictions remain Experimental until untouched tests beat the price-only baseline."
+    )
+
+    controls = st.columns(3)
+    horizon = controls[0].selectbox("Forecast horizon", ["5D", "1M", "3M"], key="news_horizon")
+    top_count = controls[1].slider("Indices per side", 3, 20, 8, key="news_top_count")
+    today_ist = datetime.now(IST).date()
+    run_date = controls[2].date_input(
+        "Signal date", value=today_ist, max_value=today_ist, key="news_run_date"
+    )
+
+    actions = st.columns(4)
+    run_news = actions[0].button(
+        "Run News",
+        type="primary",
+        use_container_width=True,
+        disabled=(run_date == today_ist and not after_news_cutoff()),
+    )
+    use_saved = actions[1].button("Use Saved News Run", use_container_width=True)
+    refresh = actions[2].button("Refresh Job and Results", use_container_width=True)
+    backfill = actions[3].button("Build / Resume Free History", use_container_width=True)
+
+    for requested, job_type, label in (
+        (run_news, "daily", "Daily news forecast"),
+        (backfill, "backfill", "Free Sandbox history batch"),
+    ):
+        if requested:
+            try:
+                queued = queue_news_workflow(job_type, run_date, OUTPUT_DIR)
+                st.success(f"{label} queued: {queued.get('job_id', 'ready')}.")
+                load_news_dashboard_state()
+            except Exception as exc:
+                st.error(f"{label} could not be queued: {exc}")
+
+    if use_saved or refresh:
+        load_news_dashboard_state()
+        st.success("Loaded the newest successful result and current job status.")
+
+    admin_password = os.getenv("NEWS_ADMIN_PASSWORD", "")
+    if admin_password:
+        with st.expander("Model administration"):
+            supplied_password = st.text_input(
+                "Administrator password", type="password", key="news_admin_password_input"
+            )
+            if st.button("Retrain Model", use_container_width=True):
+                if supplied_password != admin_password:
+                    st.error("Administrator password is incorrect.")
+                else:
+                    try:
+                        queued = queue_news_workflow("retrain", run_date, OUTPUT_DIR)
+                        st.success(f"Retraining queued: {queued.get('job_id', 'ready')}.")
+                    except Exception as exc:
+                        st.error(f"Retraining could not be queued: {exc}")
+
+    show_news_job_monitor()
+    st.caption(
+        "Historical GDELT data runs in resumable BigQuery Sandbox batches. Every date is dry-run first, "
+        "each query is capped, and the worker stops before the free monthly allowance is exhausted."
+    )
+    news_results = st.session_state.get("news_results") or load_saved_news_results(OUTPUT_DIR)
+    predictions = news_results.get("predictions", pd.DataFrame()).copy()
+    catalysts = news_results.get("catalysts", pd.DataFrame()).copy()
+    drivers = news_results.get("drivers", pd.DataFrame()).copy()
+    metrics = news_results.get("metrics", pd.DataFrame()).copy()
+    jobs = news_results.get("jobs", pd.DataFrame()).copy()
+    eligibility = news_results.get("eligibility", pd.DataFrame()).copy()
+    features = news_results.get("features", pd.DataFrame()).copy()
+    evaluation = news_results.get("evaluation", pd.DataFrame()).copy()
+    storage = news_results.get("Storage", pd.DataFrame())
+    if eligibility.empty:
+        eligibility = save_news_eligibility(OUTPUT_DIR)
+    if not storage.empty and not predictions.empty:
+        source = storage.iloc[0].get("Source", "Saved storage")
+        if bool(storage.iloc[0].get("Stale", False)):
+            st.warning(f"Showing the last locally saved forecast. Source: {source}.")
+        else:
+            st.caption(f"Result source: {source}")
+
+    if predictions.empty:
+        st.info(
+            "No completed forecast is stored yet. Use Build / Resume Free History until every historical "
+            "batch is complete, then Run News after market close."
+        )
+        with st.expander("News data services"):
+            st.dataframe(news_environment_status(), use_container_width=True, hide_index=True)
+        return
+
+    horizon_column = news_frame_column(predictions, "Horizon")
+    expected_column = news_frame_column(
+        predictions, "Expected Excess Return %", "Expected Excess Return Pct"
+    )
+    index_column = news_frame_column(predictions, "Index", "Index Name")
+    signal_column = news_frame_column(predictions, "Signal")
+    rank_column = news_frame_column(predictions, "Rank")
+    status_column = news_frame_column(predictions, "Model Status")
+    as_of_column = news_frame_column(predictions, "As Of Date")
+    ranked = (
+        predictions[predictions[horizon_column].astype(str).eq(horizon)].copy()
+        if horizon_column else predictions.copy()
+    )
+    if expected_column:
+        ranked[expected_column] = pd.to_numeric(ranked[expected_column], errors="coerce")
+        ranked = ranked.sort_values(expected_column, ascending=False)
+
+    summaries = st.columns(4)
+    summaries[0].metric("Indices Forecast", f"{len(ranked):,}")
+    summaries[1].metric(
+        "Top Tailwind", str(ranked.iloc[0][index_column]) if not ranked.empty and index_column else "NA"
+    )
+    summaries[2].metric(
+        "Model Status", str(ranked.iloc[0][status_column]) if not ranked.empty and status_column else "Experimental"
+    )
+    summaries[3].metric(
+        "As Of", str(ranked.iloc[0][as_of_column]) if not ranked.empty and as_of_column else "NA"
+    )
+
+    if expected_column and index_column and signal_column and not ranked.empty:
+        plot_frame = pd.concat([ranked.head(top_count), ranked.tail(top_count)]).drop_duplicates(index_column)
+        chart = px.bar(
+            plot_frame.sort_values(expected_column),
+            x=expected_column,
+            y=index_column,
+            orientation="h",
+            color=signal_column,
+            color_discrete_map={"Tailwind": "#14866d", "Headwind": "#c34a4a"},
+            title=f"{horizon} Expected Excess Return Versus Nifty 50",
+        )
+        chart.update_layout(height=max(480, len(plot_frame) * 28 + 120))
+        st.plotly_chart(chart, use_container_width=True)
+
+    views = st.tabs(["Rankings", "Catalysts", "Market Context", "Model Health", "Jobs", "Index Coverage"])
+    with views[0]:
+        if rank_column:
+            ranked = ranked.sort_values(rank_column)
+        st.dataframe(format_percent_columns(ranked), use_container_width=True, hide_index=True)
+        show_download("Download news catalyst rankings", ranked, "news_catalyst_rankings.csv")
+
+    with views[1]:
+        if catalysts.empty:
+            st.info("No catalyst explanations are stored for this run.")
+        else:
+            catalyst_horizon = news_frame_column(catalysts, "Horizon")
+            catalyst_view = (
+                catalysts[catalysts[catalyst_horizon].astype(str).eq(horizon)].copy()
+                if catalyst_horizon else catalysts.copy()
+            )
+            catalyst_url = news_frame_column(catalyst_view, "URL")
+            column_config = {catalyst_url: st.column_config.LinkColumn("Source")} if catalyst_url else None
+            st.dataframe(
+                catalyst_view, use_container_width=True, hide_index=True, column_config=column_config
+            )
+            show_download("Download catalyst headlines", catalyst_view, "news_catalyst_headlines.csv")
+        st.link_button("Open Zerodha Pulse manually", "https://pulse.zerodha.com/")
+        st.caption("Pulse is a manual reference only. This project does not crawl or reverse-engineer it.")
+        if not drivers.empty:
+            driver_horizon = news_frame_column(drivers, "Horizon")
+            driver_view = (
+                drivers[drivers[driver_horizon].astype(str).eq(horizon)].copy()
+                if driver_horizon else drivers.copy()
+            )
+            with st.expander("Model feature contributions", expanded=False):
+                st.dataframe(driver_view, use_container_width=True, hide_index=True)
+
+    with views[2]:
+        if features.empty:
+            st.info("No saved market-context features are available.")
+        else:
+            feature_index = news_frame_column(features, "Index", "Index Name")
+            selected = set(ranked.head(top_count)[index_column]) if index_column else set()
+            context = features[features[feature_index].isin(selected)] if feature_index and selected else features
+            st.dataframe(format_percent_columns(context), use_container_width=True, hide_index=True)
+
+    with views[3]:
+        if metrics.empty:
+            st.info("Model evaluation appears after the first historical training run.")
+        else:
+            st.dataframe(format_percent_columns(metrics), use_container_width=True, hide_index=True)
+            show_download("Download model metrics", metrics, "news_model_metrics.csv")
+        if not evaluation.empty:
+            evaluation_horizon = news_frame_column(evaluation, "Horizon")
+            actual = news_frame_column(evaluation, "Actual Excess Return %", "Actual Excess Return Pct")
+            predicted = news_frame_column(
+                evaluation, "Predicted Excess Return %", "Predicted Excess Return Pct"
+            )
+            evaluation_view = (
+                evaluation[evaluation[evaluation_horizon].astype(str).eq(horizon)].copy()
+                if evaluation_horizon else evaluation.copy()
+            )
+            if actual and predicted and not evaluation_view.empty:
+                scatter = px.scatter(
+                    evaluation_view,
+                    x=predicted,
+                    y=actual,
+                    color=news_frame_column(evaluation_view, "Index", "Index Name"),
+                    opacity=0.55,
+                    title="Untouched Test: Predicted Versus Realized Excess Return",
+                )
+                scatter.add_hline(y=0, line_dash="dot", line_color="#777777")
+                scatter.add_vline(x=0, line_dash="dot", line_color="#777777")
+                st.plotly_chart(scatter, use_container_width=True)
+
+    with views[4]:
+        st.dataframe(jobs, use_container_width=True, hide_index=True) if not jobs.empty else st.info(
+            "No job history is available."
+        )
+    with views[5]:
+        st.dataframe(eligibility, use_container_width=True, hide_index=True)
+        show_download("Download index eligibility", eligibility, "news_index_eligibility.csv")
+
+    with st.expander("News data services"):
+        st.dataframe(news_environment_status(), use_container_width=True, hide_index=True)
+        st.caption(
+            "Historical news uses the free BigQuery Sandbox with dry-run cost guards and resumable daily "
+            "checkpoints. Incremental news uses GDELT and configured permitted RSS feeds. Models and "
+            "Parquet archives live in private Supabase storage."
+        )
 
 
 def build_config() -> tuple[ScreeningConfig, str]:
@@ -504,8 +788,8 @@ tabs = st.tabs(
         "FII Accumulation",
         "DII Accumulation",
         "Quarterly Results",
-        "Derivatives Momentum",
         "Index Momentum",
+        "News Catalysts",
         "CSV Stock Momentum",
         "Correlation",
         "200DMA Finder",
@@ -963,334 +1247,6 @@ with tabs[6]:
             )
 
 with tabs[7]:
-    st.subheader("Options-Confirmed Equity Momentum")
-    st.caption(
-        "End-of-day continuation signals from official NSE cash and derivatives reports. A signal requires "
-        "the stock to rise on the signal day and its selected near-ATM call to gain at least 8%. The result "
-        "is an equity-buying signal; it is not a recommendation to buy the option."
-    )
-
-    st.markdown("**1. Download Or Resume NSE EOD Data**")
-    default_derivatives_end = date.today() - timedelta(days=1)
-    download_controls = st.columns([1, 1, 1.25, 1.25, 1])
-    derivatives_start = download_controls[0].date_input(
-        "Download start",
-        value=default_derivatives_end - timedelta(days=45),
-        key="derivatives_download_start",
-    )
-    derivatives_end = download_controls[1].date_input(
-        "Download end",
-        value=default_derivatives_end,
-        max_value=default_derivatives_end,
-        key="derivatives_download_end",
-    )
-    download_derivatives = download_controls[2].button(
-        "Download / Resume EOD Data",
-        type="primary",
-        use_container_width=True,
-    )
-    restart_derivatives = download_controls[3].button(
-        "Run Full Scan From Beginning",
-        key="restart_derivatives_download",
-        use_container_width=True,
-    )
-    recover_derivatives = download_controls[4].button(
-        "Use Saved Derivatives Run",
-        use_container_width=True,
-    )
-
-    if download_derivatives or restart_derivatives:
-        if derivatives_start > derivatives_end:
-            st.error("Download start must be on or before download end.")
-        else:
-            derivatives_download_progress = make_progress("Downloading official NSE reports by date")
-            try:
-                if restart_derivatives:
-                    reset_derivatives_eod_data(
-                        derivatives_start,
-                        derivatives_end,
-                        output_dir=OUTPUT_DIR,
-                    )
-                    st.session_state.pop("derivatives_results", None)
-                health = download_derivatives_eod_data(
-                    derivatives_start,
-                    derivatives_end,
-                    progress_callback=derivatives_download_progress,
-                    output_dir=OUTPUT_DIR,
-                )
-                saved = st.session_state.get("derivatives_results", load_saved_derivatives_results(OUTPUT_DIR))
-                saved["data_health"] = health
-                st.session_state["derivatives_results"] = saved
-                completed_dates = int(
-                    health.get("Status", pd.Series(dtype=str)).astype(str).str.lower().isin(["downloaded", "cached"]).sum()
-                )
-                prefix = "Fresh NSE EOD range downloaded." if restart_derivatives else "NSE EOD cache updated."
-                st.success(f"{prefix} {completed_dates:,} requested dates are available.")
-            except Exception as exc:
-                st.error(f"NSE EOD download stopped: {exc}. Completed dates remain cached and can be resumed.")
-
-    if recover_derivatives:
-        st.session_state["derivatives_results"] = load_saved_derivatives_results(OUTPUT_DIR)
-        st.success("Recovered the latest saved derivatives scan and backtest files.")
-
-    st.markdown("**2. Signal Rules And Ranking**")
-    rule_controls = st.columns(5)
-    derivative_signal_date = rule_controls[0].date_input(
-        "Signal date",
-        value=default_derivatives_end,
-        max_value=default_derivatives_end,
-        key="derivatives_signal_date",
-    )
-    min_stock_return = rule_controls[1].number_input(
-        "Minimum stock return %",
-        min_value=0.01,
-        max_value=25.0,
-        value=2.0,
-        step=0.25,
-        help="The stock must close up by at least this amount on the same day.",
-    )
-    min_call_return = rule_controls[2].number_input(
-        "Minimum call return %",
-        min_value=8.0,
-        max_value=500.0,
-        value=8.0,
-        step=1.0,
-        help="8% is the hard minimum. Larger call gains remain eligible and rank higher.",
-    )
-    min_call_price = rule_controls[3].number_input(
-        "Minimum call close Rs.",
-        min_value=0.0,
-        max_value=10000.0,
-        value=5.0,
-        step=1.0,
-    )
-    derivative_result_count = rule_controls[4].number_input(
-        "Maximum signals",
-        min_value=1,
-        max_value=500,
-        value=100,
-        step=10,
-    )
-
-    liquidity_controls = st.columns(4)
-    min_option_volume = liquidity_controls[0].number_input(
-        "Minimum call volume (contracts)",
-        min_value=0,
-        max_value=1000000,
-        value=100,
-        step=50,
-    )
-    min_option_oi = liquidity_controls[1].number_input(
-        "Minimum call OI (contracts)",
-        min_value=0,
-        max_value=1000000,
-        value=100,
-        step=50,
-    )
-    min_dte = liquidity_controls[2].number_input(
-        "Minimum days to expiry",
-        min_value=1,
-        max_value=60,
-        value=7,
-        step=1,
-    )
-    max_dte = liquidity_controls[3].number_input(
-        "Maximum days to expiry",
-        min_value=2,
-        max_value=90,
-        value=45,
-        step=1,
-    )
-
-    with st.expander("Ranking weights", expanded=False):
-        weight_controls = st.columns(5)
-        call_return_weight = weight_controls[0].number_input("Call return % weight", 0.0, 100.0, 35.0, 5.0)
-        stock_return_weight = weight_controls[1].number_input("Stock return % weight", 0.0, 100.0, 25.0, 5.0)
-        call_oi_weight = weight_controls[2].number_input("Call OI change weight", 0.0, 100.0, 15.0, 5.0)
-        volume_ratio_weight = weight_controls[3].number_input("Volume ratio weight", 0.0, 100.0, 15.0, 5.0)
-        futures_return_weight = weight_controls[4].number_input("Futures return weight", 0.0, 100.0, 10.0, 5.0)
-
-    total_derivative_weight = sum(
-        [call_return_weight, stock_return_weight, call_oi_weight, volume_ratio_weight, futures_return_weight]
-    )
-    settings_valid = max_dte >= min_dte and abs(total_derivative_weight - 100.0) < 0.001
-    if max_dte < min_dte:
-        st.error("Maximum days to expiry must be greater than or equal to the minimum.")
-    if abs(total_derivative_weight - 100.0) >= 0.001:
-        st.error(f"Ranking weights must total 100%. Current total: {total_derivative_weight:.1f}%.")
-
-    derivatives_config = DerivativesSignalConfig(
-        min_underlying_return_pct=float(min_stock_return),
-        min_call_return_pct=float(min_call_return),
-        min_call_price=float(min_call_price),
-        min_volume_contracts=int(min_option_volume),
-        min_open_interest_contracts=int(min_option_oi),
-        min_days_to_expiry=int(min_dte),
-        max_days_to_expiry=int(max_dte),
-        result_count=int(derivative_result_count),
-        call_return_weight=float(call_return_weight) / 100.0,
-        underlying_return_weight=float(stock_return_weight) / 100.0,
-        call_oi_change_weight=float(call_oi_weight) / 100.0,
-        call_volume_ratio_weight=float(volume_ratio_weight) / 100.0,
-        futures_return_weight=float(futures_return_weight) / 100.0,
-    )
-    run_derivatives_signal = st.button(
-        "Run Options-Confirmed Momentum",
-        type="primary",
-        disabled=not settings_valid,
-    )
-    if run_derivatives_signal:
-        derivatives_scan_progress = make_progress("Building history, then checking every ticker")
-        try:
-            scan_results = run_derivatives_momentum_screen(
-                csv_path,
-                derivatives_config,
-                scan_date=derivative_signal_date,
-                progress_callback=derivatives_scan_progress,
-                output_dir=OUTPUT_DIR,
-            )
-            existing = st.session_state.get("derivatives_results", load_saved_derivatives_results(OUTPUT_DIR))
-            existing.update(scan_results)
-            st.session_state["derivatives_results"] = existing
-            signal_count = len(scan_results["signals"])
-            st.success(f"Derivatives scan complete: {signal_count:,} stocks passed every signal and liquidity rule.")
-        except Exception as exc:
-            st.error(f"Derivatives signal scan could not finish: {exc}")
-
-    st.markdown("**3. Strategy Validation**")
-    st.caption(
-        "Signals enter the underlying equity at the next trading day's open. The event study compares the "
-        "stock-only, stock-plus-call, full derivatives, and regular momentum variants after costs."
-    )
-    backtest_controls = st.columns(6)
-    derivative_backtest_start = backtest_controls[0].date_input(
-        "Backtest start",
-        value=default_derivatives_end - timedelta(days=365 * 3),
-        key="derivatives_backtest_start",
-    )
-    derivative_backtest_end = backtest_controls[1].date_input(
-        "Backtest end",
-        value=default_derivatives_end,
-        max_value=default_derivatives_end,
-        key="derivatives_backtest_end",
-    )
-    derivative_holding_days = backtest_controls[2].number_input("Holding days", 1, 20, 5, 1)
-    derivative_top_n = backtest_controls[3].number_input("Top concurrent positions", 1, 50, 10, 1)
-    derivative_cost = backtest_controls[4].number_input("Round-trip cost %", 0.0, 5.0, 0.30, 0.05)
-    run_derivatives_backtest = backtest_controls[5].button(
-        "Run Backtest",
-        type="primary",
-        use_container_width=True,
-        disabled=not settings_valid,
-    )
-    if run_derivatives_backtest:
-        if derivative_backtest_start >= derivative_backtest_end:
-            st.error("Backtest start must be before backtest end.")
-        else:
-            derivatives_backtest_progress = make_progress("Walking forward through cached trading dates")
-            try:
-                backtest_results = run_derivatives_backtest_screen(
-                    csv_path,
-                    derivatives_config,
-                    derivative_backtest_start,
-                    derivative_backtest_end,
-                    holding_days=int(derivative_holding_days),
-                    top_n=int(derivative_top_n),
-                    round_trip_cost_pct=float(derivative_cost),
-                    progress_callback=derivatives_backtest_progress,
-                    output_dir=OUTPUT_DIR,
-                )
-                existing = st.session_state.get("derivatives_results", load_saved_derivatives_results(OUTPUT_DIR))
-                existing.update(backtest_results)
-                st.session_state["derivatives_results"] = existing
-                st.success("Chronological derivatives event study and portfolio simulation are ready.")
-            except Exception as exc:
-                st.error(f"Backtest could not finish: {exc}")
-                st.info("Download or resume the selected backtest date range first. At least 12 cached trading dates are required.")
-
-    if "derivatives_results" not in st.session_state:
-        saved_derivatives = load_saved_derivatives_results(OUTPUT_DIR)
-        if any(not frame.empty for frame in saved_derivatives.values()):
-            st.session_state["derivatives_results"] = saved_derivatives
-
-    derivatives_results = st.session_state.get("derivatives_results", {})
-    derivative_signals = derivatives_results.get("signals", pd.DataFrame())
-    derivative_features = derivatives_results.get("features", pd.DataFrame())
-    derivative_rejections = derivatives_results.get("rejections", pd.DataFrame())
-    derivative_contracts = derivatives_results.get("contracts", pd.DataFrame())
-    derivative_health = derivatives_results.get("data_health", pd.DataFrame())
-    derivative_events = derivatives_results.get("events", pd.DataFrame())
-    derivative_curve = derivatives_results.get("curve", pd.DataFrame())
-    derivative_performance = derivatives_results.get("performance", pd.DataFrame())
-    derivative_event_summary = derivatives_results.get("event_summary", pd.DataFrame())
-
-    derivative_metrics = st.columns(4)
-    eligible_count = int(
-        derivative_contracts.get("Listed Derivatives", pd.Series(dtype=bool)).astype(str).str.lower().isin(["true", "1"]).sum()
-    ) if not derivative_contracts.empty else 0
-    derivative_metrics[0].metric("Ticker Universe", f"{len(derivative_contracts):,}")
-    derivative_metrics[1].metric("Listed Stock F&O", f"{eligible_count:,}")
-    derivative_metrics[2].metric("F&O Features Checked", f"{len(derivative_features):,}")
-    derivative_metrics[3].metric("Qualified Signals", f"{len(derivative_signals):,}")
-
-    derivative_tabs = st.tabs(["Ranked Signals", "Rejected Candidates", "F&O Universe", "Data Health", "Backtest"])
-    with derivative_tabs[0]:
-        if derivative_signals.empty:
-            st.info("No saved qualifying signals yet, or no stock passed every rule on the selected date.")
-        else:
-            st.dataframe(format_percent_columns(derivative_signals), use_container_width=True, hide_index=True)
-            show_download("Download derivatives signals", derivative_signals, "derivatives_signals.csv")
-    with derivative_tabs[1]:
-        if derivative_rejections.empty:
-            st.info("Run a derivatives signal scan to inspect rejection reasons.")
-        else:
-            st.dataframe(format_percent_columns(derivative_rejections), use_container_width=True, hide_index=True)
-            show_download("Download rejected candidates", derivative_rejections, "derivatives_rejections.csv")
-    with derivative_tabs[2]:
-        if derivative_contracts.empty:
-            st.info("Run a derivatives signal scan to map the full ticker universe to NSE stock F&O eligibility.")
-        else:
-            st.dataframe(derivative_contracts, use_container_width=True, hide_index=True)
-            show_download("Download F&O universe", derivative_contracts, "derivatives_contracts.csv")
-    with derivative_tabs[3]:
-        if derivative_health.empty:
-            st.info("Download an NSE EOD date range to see cached, completed, and unavailable report dates.")
-        else:
-            st.dataframe(derivative_health, use_container_width=True, hide_index=True)
-            show_download("Download data health", derivative_health, "derivatives_data_health.csv")
-            st.caption(f"Raw and normalized reports are checkpointed under {paths['derivatives_cache']}.")
-    with derivative_tabs[4]:
-        if derivative_curve.empty:
-            st.info("Download a historical EOD range and run the derivatives backtest to see strategy validation.")
-        else:
-            chart_frame = derivative_curve.copy()
-            chart_frame["Date"] = pd.to_datetime(chart_frame["Date"], errors="coerce")
-            chart = px.line(
-                chart_frame.dropna(subset=["Date"]),
-                x="Date",
-                y="Portfolio Value",
-                color="Variant",
-                title="Walk-Forward Portfolio Value",
-            )
-            st.plotly_chart(chart, use_container_width=True)
-        if not derivative_performance.empty:
-            st.markdown("**Portfolio Performance**")
-            st.dataframe(format_percent_columns(derivative_performance), use_container_width=True, hide_index=True)
-        if not derivative_event_summary.empty:
-            st.markdown("**Event Study By Chronological Split**")
-            st.dataframe(format_percent_columns(derivative_event_summary), use_container_width=True, hide_index=True)
-        if not derivative_events.empty:
-            st.markdown("**Backtest Events**")
-            st.dataframe(format_percent_columns(derivative_events), use_container_width=True, hide_index=True)
-            show_download("Download backtest events", derivative_events, "derivatives_backtest_events.csv")
-            show_download("Download backtest curve", derivative_curve, "derivatives_backtest_curve.csv")
-        st.caption(
-            "The Train, Validation, and Test periods are chronological 60% / 20% / 20% splits. Treat the strategy "
-            "as promising only when the full derivatives signal improves the untouched Test period over the equity-only baseline after costs."
-        )
-
-
-with tabs[8]:
     st.subheader("NSE Index Momentum")
     st.caption(
         "Recent-return momentum across the NSE index catalogue you supplied. This replaces the relative sector-rotation model and ranks each index on its own price trend."
@@ -1517,6 +1473,8 @@ with tabs[8]:
                 st.dataframe(index_health, use_container_width=True, hide_index=True)
                 show_download("Download index data health", index_health, "index_momentum_health.csv")
 
+with tabs[8]:
+    render_news_catalysts()
 
 
 with tabs[9]:
