@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 import json
 import os
@@ -298,11 +299,25 @@ def _read_csv(path: Path) -> pd.DataFrame:
 
 def _database_records(frame: pd.DataFrame) -> list[dict[str, object]]:
     normalized = frame.rename(columns={column: _snake_case(column) for column in frame.columns}).copy()
-    for column in normalized:
-        if pd.api.types.is_datetime64_any_dtype(normalized[column]):
-            normalized[column] = normalized[column].map(lambda value: value.isoformat() if pd.notna(value) else None)
     normalized = normalized.astype(object).where(pd.notna(normalized), None)
-    return normalized.to_dict("records")
+    return [
+        {key: _json_value(value) for key, value in record.items()}
+        for record in normalized.to_dict("records")
+    ]
+
+
+def _json_value(value: object) -> object:
+    if value is None:
+        return None
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    if hasattr(value, "item"):
+        return value.item()
+    return value
 
 
 def _display_columns(frame: pd.DataFrame) -> pd.DataFrame:

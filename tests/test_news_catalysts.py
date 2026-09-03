@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 import re
 import tempfile
 import unittest
@@ -28,7 +28,7 @@ from screener_momentum.news_sources import (
     deduplicate_articles,
     normalize_news_frame,
 )
-from screener_momentum.news_store import LocalNewsResultStore, SupabaseNewsResultStore
+from screener_momentum.news_store import LocalNewsResultStore, SupabaseNewsResultStore, _database_records
 
 
 class NewsCatalystPointInTimeTests(unittest.TestCase):
@@ -315,6 +315,21 @@ class NewsCatalystStorageTests(unittest.TestCase):
             rows = store.select("news_pipeline_jobs")
 
         self.assertEqual(rows, [{"status": "completed"}])
+
+    def test_supabase_records_serialize_python_dates(self) -> None:
+        records = _database_records(
+            pd.DataFrame(
+                [
+                    {
+                        "Partition Date": date(2026, 9, 3),
+                        "Processed At UTC": pd.Timestamp("2026-09-03T12:00:00Z"),
+                    }
+                ]
+            )
+        )
+
+        self.assertEqual(records[0]["partition_date"], "2026-09-03")
+        self.assertEqual(records[0]["processed_at_utc"], "2026-09-03T12:00:00+00:00")
 
     def test_deduplication_uses_canonical_urls(self) -> None:
         frame = pd.DataFrame(
