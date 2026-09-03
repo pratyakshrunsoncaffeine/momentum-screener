@@ -5,6 +5,7 @@ from datetime import date, datetime
 from pathlib import Path
 import json
 import os
+import time
 from typing import Protocol
 from uuid import uuid4
 
@@ -88,6 +89,9 @@ class SupabaseNewsResultStore:
     url: str
     service_key: str
     timeout: int = 45
+    upsert_batch_rows: int = 250
+    upsert_batch_bytes: int = 750_000
+    upsert_retry_attempts: int = 3
 
     @classmethod
     def from_environment(cls) -> "SupabaseNewsResultStore":
@@ -154,6 +158,44 @@ class SupabaseNewsResultStore:
         if frame.empty:
             return
         records = _database_records(frame)
+        for batch in _record_batches(
+            records,
+            maximum_rows=self.upsert_batch_rows,
+            maximum_bytes=self.upsert_batch_bytes,
+        ):
+            self._upsert_batch(table, batch, on_conflict)
+
+    def _upsert_batch(
+        self,
+        table: str,
+        records: list[dict[str, object]],
+        on_conflict: str,
+        split_depth: int = 0,
+    ) -> None:
+        last_error: requests.RequestException | None = None
+        for attempt in range(max(1, self.upsert_retry_attempts)):
+            try:
+                self._post_upsert(table, records, on_conflict)
+                return
+            except requests.RequestException as exc:
+                last_error = exc
+                if not _is_transient_request_error(exc) or attempt + 1 >= self.upsert_retry_attempts:
+                    break
+                time.sleep(0.5 * (2**attempt))
+
+        if len(records) > 10 and split_depth < 3:
+            midpoint = len(records) // 2
+            self._upsert_batch(table, records[:midpoint], on_conflict, split_depth + 1)
+            self._upsert_batch(table, records[midpoint:], on_conflict, split_depth + 1)
+            return
+        raise RuntimeError(_supabase_error_message(table, len(records), last_error)) from last_error
+
+    def _post_upsert(
+        self,
+        table: str,
+        records: list[dict[str, object]],
+        on_conflict: str,
+    ) -> None:
         response = requests.post(
             f"{self.url}/rest/v1/{table}",
             headers={
@@ -304,6 +346,55 @@ def _database_records(frame: pd.DataFrame) -> list[dict[str, object]]:
         {key: _json_value(value) for key, value in record.items()}
         for record in normalized.to_dict("records")
     ]
+
+
+def _record_batches(
+    records: list[dict[str, object]],
+    maximum_rows: int = 250,
+    maximum_bytes: int = 750_000,
+) -> list[list[dict[str, object]]]:
+    row_limit = max(1, int(maximum_rows))
+    byte_limit = max(1, int(maximum_bytes))
+    batches: list[list[dict[str, object]]] = []
+    batch: list[dict[str, object]] = []
+    batch_bytes = 2
+    for record in records:
+        record_bytes = len(
+            json.dumps(record, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        ) + (1 if batch else 0)
+        if batch and (len(batch) >= row_limit or batch_bytes + record_bytes > byte_limit):
+            batches.append(batch)
+            batch = []
+            batch_bytes = 2
+            record_bytes -= 1
+        batch.append(record)
+        batch_bytes += record_bytes
+    if batch:
+        batches.append(batch)
+    return batches
+
+
+def _is_transient_request_error(exc: requests.RequestException) -> bool:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return True
+    return response.status_code == 429 or response.status_code >= 500
+
+
+def _supabase_error_message(
+    table: str,
+    record_count: int,
+    exc: requests.RequestException | None,
+) -> str:
+    if exc is None:
+        return f"Supabase upsert failed for {table} ({record_count} records)."
+    response = getattr(exc, "response", None)
+    if response is None:
+        detail = str(exc)
+    else:
+        detail = " ".join(str(response.text or "").split())[:1000]
+        detail = f"HTTP {response.status_code}" + (f": {detail}" if detail else "")
+    return f"Supabase upsert failed for {table} ({record_count} records): {detail}"
 
 
 def _json_value(value: object) -> object:

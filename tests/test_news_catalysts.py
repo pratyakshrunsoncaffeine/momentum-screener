@@ -28,7 +28,12 @@ from screener_momentum.news_sources import (
     deduplicate_articles,
     normalize_news_frame,
 )
-from screener_momentum.news_store import LocalNewsResultStore, SupabaseNewsResultStore, _database_records
+from screener_momentum.news_store import (
+    LocalNewsResultStore,
+    SupabaseNewsResultStore,
+    _database_records,
+    _record_batches,
+)
 
 
 class NewsCatalystPointInTimeTests(unittest.TestCase):
@@ -330,6 +335,30 @@ class NewsCatalystStorageTests(unittest.TestCase):
 
         self.assertEqual(records[0]["partition_date"], "2026-09-03")
         self.assertEqual(records[0]["processed_at_utc"], "2026-09-03T12:00:00+00:00")
+
+    def test_supabase_upsert_batches_large_frames(self) -> None:
+        response = Mock(status_code=201, text="")
+        response.raise_for_status.return_value = None
+        store = SupabaseNewsResultStore(
+            "https://example.supabase.co",
+            "service-key",
+            upsert_batch_rows=2,
+            upsert_batch_bytes=100_000,
+        )
+        frame = pd.DataFrame([{"Article ID": str(value)} for value in range(5)])
+
+        with patch("screener_momentum.news_store.requests.post", return_value=response) as post:
+            store.upsert("news_articles", frame, "article_id")
+
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual([len(call.kwargs["json"]) for call in post.call_args_list], [2, 2, 1])
+
+    def test_supabase_record_batches_obey_payload_limit(self) -> None:
+        records = [{"article_id": str(value), "title": "x" * 40} for value in range(3)]
+
+        batches = _record_batches(records, maximum_rows=10, maximum_bytes=100)
+
+        self.assertEqual([len(batch) for batch in batches], [1, 1, 1])
 
     def test_deduplication_uses_canonical_urls(self) -> None:
         frame = pd.DataFrame(
