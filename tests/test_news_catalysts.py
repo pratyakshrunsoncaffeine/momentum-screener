@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-import re
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -25,6 +24,7 @@ from screener_momentum.news_sources import (
     AuthorizedPulseProvider,
     BigQuerySandboxBudgetExceeded,
     GdeltBigQueryProvider,
+    _query_term_groups,
     deduplicate_articles,
     normalize_news_frame,
 )
@@ -371,11 +371,10 @@ class NewsCatalystStorageTests(unittest.TestCase):
 
     def test_gdelt_query_terms_do_not_include_boolean_operators(self) -> None:
         query = '(india OR nifty OR "reserve bank of india") AND (oil OR inflation)'
-        phrases = re.findall(r'"([^"]+)"', query)
-        unquoted = re.sub(r'"[^"]+"', " ", query)
-        words = re.findall(r"\b[A-Za-z][A-Za-z&-]{2,}\b", unquoted)
-        tokens = [item.lower() for item in [*phrases, *words] if item.lower() not in {"and", "or", "not"}]
-        self.assertEqual(tokens, ["reserve bank of india", "india", "nifty", "oil", "inflation"])
+        groups = _query_term_groups(query)
+
+        self.assertEqual(groups[0], ["reserve bank of india", "india", "nifty"])
+        self.assertEqual(groups[1], ["oil", "inflation"])
 
     def test_pulse_provider_refuses_unauthorized_scraping(self) -> None:
         with self.assertRaises(PermissionError):

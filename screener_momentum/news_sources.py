@@ -335,20 +335,19 @@ class GdeltBigQueryProvider:
         query: str,
         sample_percent: float,
     ):
-        phrases = re.findall(r'"([^"]+)"', query)
-        unquoted = re.sub(r'"[^"]+"', " ", query)
-        words = re.findall(r"\b[A-Za-z][A-Za-z&-]{2,}\b", unquoted)
-        tokens = list(
-            dict.fromkeys(
-                token.lower().strip()
-                for token in [*phrases, *words]
-                if token.lower().strip() not in {"and", "or", "not"}
-            )
-        )[:40]
-        patterns = [f"%{token}%" for token in tokens]
+        term_groups = _query_term_groups(query)
         sample = min(max(float(sample_percent), 0.01), 100.0)
         sample_clause = "" if sample >= 100.0 else f" TABLESAMPLE SYSTEM ({sample:.4f} PERCENT)"
         row_limit = max(1, int(self.maximum_rows))
+        search_text = (
+            "LOWER(CONCAT(IFNULL(Themes, ''), ' ', IFNULL(Organizations, ''), "
+            "' ', IFNULL(Locations, '')))"
+        )
+        group_filters = "\n              ".join(
+            f"AND EXISTS (SELECT 1 FROM UNNEST(@patterns_{position}) AS pattern "
+            f"WHERE {search_text} LIKE pattern)"
+            for position in range(len(term_groups))
+        )
         sql = f"""
             SELECT
               SAFE.PARSE_TIMESTAMP('%Y%m%d%H%M%S', CAST(DATE AS STRING)) AS published_at,
@@ -360,17 +359,19 @@ class GdeltBigQueryProvider:
             FROM `{self.table}`{sample_clause}
             WHERE _PARTITIONTIME >= @start_time
               AND _PARTITIONTIME < @end_time
-              AND EXISTS (
-                SELECT 1 FROM UNNEST(@patterns) AS pattern
-                WHERE LOWER(CONCAT(IFNULL(Themes, ''), ' ', IFNULL(Organizations, ''), ' ', IFNULL(Locations, '')))
-                      LIKE pattern
-              )
+              {group_filters}
+            ORDER BY FARM_FINGERPRINT(IFNULL(DocumentIdentifier, ''))
             LIMIT {row_limit}
         """
         parameters = [
             bigquery.ScalarQueryParameter("start_time", "TIMESTAMP", _utc_timestamp(start).to_pydatetime()),
             bigquery.ScalarQueryParameter("end_time", "TIMESTAMP", _utc_timestamp(end).to_pydatetime()),
-            bigquery.ArrayQueryParameter("patterns", "STRING", patterns or ["%india%"]),
+            *[
+                bigquery.ArrayQueryParameter(
+                    f"patterns_{position}", "STRING", [f"%{token}%" for token in tokens]
+                )
+                for position, tokens in enumerate(term_groups)
+            ],
         ]
         return sql, parameters
 
@@ -385,8 +386,8 @@ class GdeltBigQueryProvider:
                 "Snippet": "",
                 "URL": raw.get("url"),
                 "GDELT Tone": pd.to_numeric(tone, errors="coerce"),
-                "Themes": raw.get("themes"),
-                "Organizations": raw.get("organizations"),
+                "Themes": _bounded_text_series(raw.get("themes"), len(raw), 4_000),
+                "Organizations": _bounded_text_series(raw.get("organizations"), len(raw), 4_000),
                 "Source Type": (
                     "gdelt_bigquery" if sample_percent >= 100.0 else "gdelt_bigquery_sampled"
                 ),
@@ -405,6 +406,34 @@ class GdeltQueryStats:
 
 class BigQuerySandboxBudgetExceeded(RuntimeError):
     pass
+
+
+def _query_term_groups(query: str) -> list[list[str]]:
+    grouped = re.findall(r"\(([^()]*)\)", str(query))
+    sources = grouped if grouped else [str(query)]
+    result: list[list[str]] = []
+    for source in sources[:4]:
+        phrases = re.findall(r'"([^"]+)"', source)
+        unquoted = re.sub(r'"[^"]+"', " ", source)
+        words = re.findall(r"\b[A-Za-z][A-Za-z&-]{2,}\b", unquoted)
+        tokens = list(
+            dict.fromkeys(
+                token.lower().strip()
+                for token in [*phrases, *words]
+                if token.lower().strip() not in {"and", "or", "not"}
+            )
+        )[:40]
+        if tokens:
+            result.append(tokens)
+    return result or [["india"]]
+
+
+def _bounded_text_series(value: object, length: int, maximum_length: int) -> pd.Series:
+    if isinstance(value, pd.Series):
+        series = value.reset_index(drop=True)
+    else:
+        series = pd.Series([value] * length)
+    return series.fillna("").astype(str).str.slice(0, maximum_length)
 
 
 def _format_bytes(value: int) -> str:

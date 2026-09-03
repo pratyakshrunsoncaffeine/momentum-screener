@@ -59,7 +59,8 @@ class NewsCatalystConfig:
     bigquery_monthly_budget_gib: float = 900.0
     bigquery_max_query_gib: float = 5.0
     bigquery_min_sample_pct: float = 1.0
-    bigquery_result_row_limit: int = 25_000
+    # Keeps five years of sampled GDELT metadata inside Supabase's free database tier.
+    bigquery_result_row_limit: int = 40
     minimum_history_days: int = 252
     transaction_cost_pct: float = 0.20
     random_seed: int = 42
