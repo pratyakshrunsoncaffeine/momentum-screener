@@ -14,7 +14,7 @@ on:
       partitions_per_run:
         description: Maximum daily GDELT partitions processed in this free Sandbox batch
         required: false
-        default: "90"
+        default: "2000"
         type: string
 
 permissions:
@@ -42,8 +42,8 @@ jobs:
       NEWS_BIGQUERY_MONTHLY_BUDGET_GIB: "900"
       NEWS_BIGQUERY_MAX_QUERY_GIB: "5"
       NEWS_BIGQUERY_MIN_SAMPLE_PCT: "1"
-      # Forty representative articles per day keeps five years inside Supabase's free tier.
-      NEWS_BIGQUERY_RESULT_ROW_LIMIT: "40"
+      # Twenty representative articles per day leaves room for features on Supabase's free tier.
+      NEWS_BIGQUERY_RESULT_ROW_LIMIT: "20"
       NEWS_RSS_FEEDS_JSON: ${{ secrets.NEWS_RSS_FEEDS_JSON }}
       TOKENIZERS_PARALLELISM: "false"
     steps:

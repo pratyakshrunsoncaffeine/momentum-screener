@@ -55,12 +55,12 @@ class NewsCatalystConfig:
     late_arrival_hours: int = 48
     maximum_articles_per_fetch: int = 250
     bigquery_sandbox: bool = True
-    bigquery_partitions_per_run: int = 90
+    bigquery_partitions_per_run: int = 2_000
     bigquery_monthly_budget_gib: float = 900.0
     bigquery_max_query_gib: float = 5.0
     bigquery_min_sample_pct: float = 1.0
     # Keeps five years of sampled GDELT metadata inside Supabase's free database tier.
-    bigquery_result_row_limit: int = 40
+    bigquery_result_row_limit: int = 20
     minimum_history_days: int = 252
     transaction_cost_pct: float = 0.20
     random_seed: int = 42
