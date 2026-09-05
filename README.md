@@ -97,37 +97,6 @@ The default weights are 20% for 2 days, 30% for 5 days, and 50% for 10 days. The
 
 The `Index Momentum` tab uses the complete 128-index catalogue supplied from NSE, covering derivatives-eligible, broad-market, sectoral, strategy, and thematic indices. It downloads official daily index closes from NSE Indices and ranks each available index independently, so a newer index does not force every other index onto a shorter common date range.
 
-## News Catalysts
-
-The `News Catalysts` tab is an after-close research system for 5-day, 1-month, and 3-month NSE index forecasts. It combines point-in-time news, official NSE index closes, dated constituent activity, and the existing index momentum features. The dashboard queues background jobs and always keeps the last successful prediction available if a later job fails.
-
-The data and model stack is deliberately separated from the Streamlit process:
-
-- Filtered five-year GDELT backfills run through the no-card BigQuery Sandbox. Every UTC date is dry-run first, capped at 5 GiB, adaptively sampled when necessary, and checkpointed in Supabase before the next date begins. Incremental runs use GDELT plus explicitly configured, permitted publisher RSS feeds with a 48-hour overlap.
-- Supabase PostgreSQL stores articles, dated index attribution, constituents, prices, features, labels, jobs, model versions, predictions, and catalysts. `pgvector` stores sentence embeddings; private Supabase Object Storage stores Parquet partitions and model artifacts.
-- SQLMesh builds incremental point-in-time news features and forward labels. News after 4:30 PM IST is assigned to the next trading session.
-- FinBERT produces sentiment when headline text is available. GDELT tone fallback is labelled explicitly for metadata-only records.
-- Pooled LightGBM regressors/classifiers are ensembled with Ridge. A price-only LightGBM model is the mandatory benchmark.
-- Saved catalyst headlines are paired with SHAP feature contributions for the selected horizon.
-- Winsorization, empirical-Bayes sentiment shrinkage, embedding compression, minimum source/article features, and exponentially weighted aggregation reduce noise.
-- Training-only headline dropout, embedding noise, source masking, relevance jitter, and technical-feature jitter are enabled only if the validation ablation improves. Dates, labels, index identities, split boundaries, and constituent effective dates are never altered.
-- Training uses chronological 60%/20%/20% partitions with a 63-trading-day embargo. A model remains `Experimental` unless its untouched-test rank IC is positive and beats the price-only baseline on at least two horizons.
-
-Pulse by Zerodha is not scraped or reverse-engineered. The dashboard provides only a manual Pulse link; an automated adapter remains disabled unless Zerodha supplies an authorized interface.
-
-### News Setup
-
-1. Create a Supabase project and run [`supabase/news_schema.sql`](supabase/news_schema.sql) in its SQL editor.
-2. Create a Google Cloud project without linking billing. Open BigQuery once to activate Sandbox, then create a service account with `BigQuery Job User` and `BigQuery Read Session User` roles.
-3. Add these GitHub repository secrets: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_DB_HOST`, `SUPABASE_DB_USER`, `SUPABASE_DB_PASSWORD`, `SUPABASE_DB_NAME`, `GOOGLE_CLOUD_PROJECT`, and `GOOGLE_CLOUD_SERVICE_ACCOUNT_JSON`. The worker intentionally constructs its database connection from these fields so the password is not duplicated inside a URL secret.
-4. Optionally add `NEWS_RSS_FEEDS_JSON` as a JSON object containing only feeds whose terms permit automated retrieval.
-5. Add the values from [`.streamlit/secrets.toml.example`](.streamlit/secrets.toml.example) to Streamlit Community Cloud secrets. Use a new fine-grained GitHub token limited to this repository with Actions write access.
-6. Run `News Catalysts - Historical Backfill`. It processes the full five-year ledger in one resumable job by default; if GitHub stops the job at its six-hour safety limit, run it again and it will continue from the last completed date. Daily inference runs after 4:30 PM IST on weekdays; retraining runs monthly.
-
-The workflow reserves roughly 10% of Sandbox's monthly 1 TiB query allowance and never relies on `LIMIT` as a query-cost control. `LIMIT` restricts the saved training sample to 20 representative India-and-market articles per day so five years plus model features retain headroom on Supabase's free database tier; dry runs, partition pruning, adaptive `TABLESAMPLE`, and `maximum_bytes_billed` enforce the BigQuery boundary. If the 900 GiB guard is reached, the job moves to `waiting_for_resume` and can continue after the monthly quota resets. BigQuery stores no durable training corpus; Supabase holds the persistent sample, so Sandbox's 60-day BigQuery table expiration does not affect saved history.
-
-Heavy worker packages are isolated in `requirements-ml.txt`; normal Streamlit deployment continues to use `requirements.txt`.
-
 The near-term default score is 10% for the 2-day return, 20% for 5 days, 25% for 10 days, 25% for 1 month, 15% for 2 months, and 5% for 3 months. All six weights are adjustable inside the tab and normalized automatically. The complete ranking remains visible, while `Short-Term Positive` identifies indices whose 2-day, 5-day, and 10-day returns are all positive.
 
 Use `Run / Resume Index Scan` to refresh official data, `Recalculate Saved Prices` to apply changed weights without another download, `Run Full Scan From Beginning` to clear only this index cache, or `Use Saved Index Results` to recover the latest ranking.

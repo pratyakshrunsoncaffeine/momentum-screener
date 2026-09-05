@@ -1080,6 +1080,12 @@ def run_price_returns(
         progress_callback=progress_callback,
     )
     returns = calculate_returns(universe, prices, progress_callback=progress_callback)
+    valid_prices = int(pd.to_numeric(returns["CMP Rs."], errors="coerce").notna().sum())
+    if valid_prices == 0:
+        raise RuntimeError(
+            "Yahoo Finance returned no usable prices. The previous saved momentum run was kept; "
+            "please retry after checking the data connection."
+        )
     save_frame(returns, output_paths(output_dir)["returns"])
     return returns
 

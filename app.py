@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
-import os
+from datetime import date, timedelta
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -29,13 +28,6 @@ from screener_momentum.index_momentum import (
     INDEX_MOMENTUM_PERIODS,
     index_catalogue_frame,
     normalized_index_performance,
-)
-from screener_momentum.news_config import IST, after_news_cutoff
-from screener_momentum.news_pipeline import (
-    load_saved_news_results,
-    news_environment_status,
-    queue_news_workflow,
-    save_news_eligibility,
 )
 from screener_momentum.pipeline import (
     finalize_dii_momentum_screen,
@@ -75,294 +67,10 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_TICKER_FILE = ROOT / "ticker.csv"
 OUTPUT_DIR = ROOT / "output" / "latest"
 
-NEWS_SECRET_KEYS = (
-    "SUPABASE_URL",
-    "SUPABASE_SERVICE_ROLE_KEY",
-    "NEWS_GITHUB_ACTIONS_TOKEN",
-    "NEWS_GITHUB_REPOSITORY",
-    "NEWS_GITHUB_BRANCH",
-    "NEWS_ADMIN_PASSWORD",
-)
-
-
-def configure_news_secrets() -> None:
-    try:
-        secrets = st.secrets
-        for key in NEWS_SECRET_KEYS:
-            value = secrets.get(key)
-            if value and not os.getenv(key):
-                os.environ[key] = str(value)
-    except (FileNotFoundError, KeyError, AttributeError):
-        return
-
-
-def news_frame_column(frame: pd.DataFrame, *names: str) -> str | None:
-    lookup = {str(column).lower(): str(column) for column in frame.columns}
-    for name in names:
-        if name.lower() in lookup:
-            return lookup[name.lower()]
-    return None
-
-
-def load_news_dashboard_state() -> None:
-    st.session_state["news_results"] = load_saved_news_results(OUTPUT_DIR)
-
-
-@st.fragment(run_every="15s")
-def show_news_job_monitor() -> None:
-    results = load_saved_news_results(OUTPUT_DIR)
-    jobs = results.get("jobs", pd.DataFrame())
-    if jobs.empty:
-        st.caption("No background news job has been queued yet.")
-        return
-    requested = news_frame_column(jobs, "Requested At UTC")
-    if requested:
-        jobs = jobs.sort_values(requested, ascending=False)
-    latest = jobs.iloc[0]
-    status_column = news_frame_column(jobs, "Status")
-    completed_column = news_frame_column(jobs, "Completed")
-    total_column = news_frame_column(jobs, "Total")
-    message_column = news_frame_column(jobs, "Message")
-    status = str(latest.get(status_column, "unknown")) if status_column else "unknown"
-    completed_value = pd.to_numeric(latest.get(completed_column, 0), errors="coerce") if completed_column else 0
-    total_value = pd.to_numeric(latest.get(total_column, 0), errors="coerce") if total_column else 0
-    completed = 0 if pd.isna(completed_value) else int(completed_value)
-    total = 0 if pd.isna(total_value) else int(total_value)
-    st.caption(f"Latest background job: {status}")
-    if total > 0:
-        st.progress(min(completed / total, 1.0), text=f"{completed:,} of {total:,}")
-    if message_column and pd.notna(latest.get(message_column)):
-        st.caption(str(latest.get(message_column)))
-
-
 st.set_page_config(
     page_title="Momentum Screener",
     layout="wide",
 )
-
-configure_news_secrets()
-
-
-def render_news_catalysts() -> None:
-    st.subheader("News Catalysts")
-    st.caption(
-        "After-close NSE index forecasts from point-in-time India news, official index prices, and constituent activity. Predictions remain Experimental until untouched tests beat the price-only baseline."
-    )
-
-    controls = st.columns(3)
-    horizon = controls[0].selectbox("Forecast horizon", ["5D", "1M", "3M"], key="news_horizon")
-    top_count = controls[1].slider("Indices per side", 3, 20, 8, key="news_top_count")
-    today_ist = datetime.now(IST).date()
-    run_date = controls[2].date_input(
-        "Signal date", value=today_ist, max_value=today_ist, key="news_run_date"
-    )
-
-    actions = st.columns(4)
-    run_news = actions[0].button(
-        "Run News",
-        type="primary",
-        use_container_width=True,
-        disabled=(run_date == today_ist and not after_news_cutoff()),
-    )
-    use_saved = actions[1].button("Use Saved News Run", use_container_width=True)
-    refresh = actions[2].button("Refresh Job and Results", use_container_width=True)
-    backfill = actions[3].button("Build / Resume Free History", use_container_width=True)
-
-    for requested, job_type, label in (
-        (run_news, "daily", "Daily news forecast"),
-        (backfill, "backfill", "Free Sandbox history batch"),
-    ):
-        if requested:
-            try:
-                queued = queue_news_workflow(job_type, run_date, OUTPUT_DIR)
-                st.success(f"{label} queued: {queued.get('job_id', 'ready')}.")
-                load_news_dashboard_state()
-            except Exception as exc:
-                st.error(f"{label} could not be queued: {exc}")
-
-    if use_saved or refresh:
-        load_news_dashboard_state()
-        st.success("Loaded the newest successful result and current job status.")
-
-    admin_password = os.getenv("NEWS_ADMIN_PASSWORD", "")
-    if admin_password:
-        with st.expander("Model administration"):
-            supplied_password = st.text_input(
-                "Administrator password", type="password", key="news_admin_password_input"
-            )
-            if st.button("Retrain Model", use_container_width=True):
-                if supplied_password != admin_password:
-                    st.error("Administrator password is incorrect.")
-                else:
-                    try:
-                        queued = queue_news_workflow("retrain", run_date, OUTPUT_DIR)
-                        st.success(f"Retraining queued: {queued.get('job_id', 'ready')}.")
-                    except Exception as exc:
-                        st.error(f"Retraining could not be queued: {exc}")
-
-    show_news_job_monitor()
-    st.caption(
-        "Historical GDELT data runs in resumable BigQuery Sandbox batches. Every date is dry-run first, "
-        "each query is capped, and the worker stops before the free monthly allowance is exhausted."
-    )
-    news_results = st.session_state.get("news_results") or load_saved_news_results(OUTPUT_DIR)
-    predictions = news_results.get("predictions", pd.DataFrame()).copy()
-    catalysts = news_results.get("catalysts", pd.DataFrame()).copy()
-    drivers = news_results.get("drivers", pd.DataFrame()).copy()
-    metrics = news_results.get("metrics", pd.DataFrame()).copy()
-    jobs = news_results.get("jobs", pd.DataFrame()).copy()
-    eligibility = news_results.get("eligibility", pd.DataFrame()).copy()
-    features = news_results.get("features", pd.DataFrame()).copy()
-    evaluation = news_results.get("evaluation", pd.DataFrame()).copy()
-    storage = news_results.get("Storage", pd.DataFrame())
-    if eligibility.empty:
-        eligibility = save_news_eligibility(OUTPUT_DIR)
-    if not storage.empty and not predictions.empty:
-        source = storage.iloc[0].get("Source", "Saved storage")
-        if bool(storage.iloc[0].get("Stale", False)):
-            st.warning(f"Showing the last locally saved forecast. Source: {source}.")
-        else:
-            st.caption(f"Result source: {source}")
-
-    if predictions.empty:
-        st.info(
-            "No completed forecast is stored yet. Use Build / Resume Free History until every historical "
-            "batch is complete, then Run News after market close."
-        )
-        with st.expander("News data services"):
-            st.dataframe(news_environment_status(), use_container_width=True, hide_index=True)
-        return
-
-    horizon_column = news_frame_column(predictions, "Horizon")
-    expected_column = news_frame_column(
-        predictions, "Expected Excess Return %", "Expected Excess Return Pct"
-    )
-    index_column = news_frame_column(predictions, "Index", "Index Name")
-    signal_column = news_frame_column(predictions, "Signal")
-    rank_column = news_frame_column(predictions, "Rank")
-    status_column = news_frame_column(predictions, "Model Status")
-    as_of_column = news_frame_column(predictions, "As Of Date")
-    ranked = (
-        predictions[predictions[horizon_column].astype(str).eq(horizon)].copy()
-        if horizon_column else predictions.copy()
-    )
-    if expected_column:
-        ranked[expected_column] = pd.to_numeric(ranked[expected_column], errors="coerce")
-        ranked = ranked.sort_values(expected_column, ascending=False)
-
-    summaries = st.columns(4)
-    summaries[0].metric("Indices Forecast", f"{len(ranked):,}")
-    summaries[1].metric(
-        "Top Tailwind", str(ranked.iloc[0][index_column]) if not ranked.empty and index_column else "NA"
-    )
-    summaries[2].metric(
-        "Model Status", str(ranked.iloc[0][status_column]) if not ranked.empty and status_column else "Experimental"
-    )
-    summaries[3].metric(
-        "As Of", str(ranked.iloc[0][as_of_column]) if not ranked.empty and as_of_column else "NA"
-    )
-
-    if expected_column and index_column and signal_column and not ranked.empty:
-        plot_frame = pd.concat([ranked.head(top_count), ranked.tail(top_count)]).drop_duplicates(index_column)
-        chart = px.bar(
-            plot_frame.sort_values(expected_column),
-            x=expected_column,
-            y=index_column,
-            orientation="h",
-            color=signal_column,
-            color_discrete_map={"Tailwind": "#14866d", "Headwind": "#c34a4a"},
-            title=f"{horizon} Expected Excess Return Versus Nifty 50",
-        )
-        chart.update_layout(height=max(480, len(plot_frame) * 28 + 120))
-        st.plotly_chart(chart, use_container_width=True)
-
-    views = st.tabs(["Rankings", "Catalysts", "Market Context", "Model Health", "Jobs", "Index Coverage"])
-    with views[0]:
-        if rank_column:
-            ranked = ranked.sort_values(rank_column)
-        st.dataframe(format_percent_columns(ranked), use_container_width=True, hide_index=True)
-        show_download("Download news catalyst rankings", ranked, "news_catalyst_rankings.csv")
-
-    with views[1]:
-        if catalysts.empty:
-            st.info("No catalyst explanations are stored for this run.")
-        else:
-            catalyst_horizon = news_frame_column(catalysts, "Horizon")
-            catalyst_view = (
-                catalysts[catalysts[catalyst_horizon].astype(str).eq(horizon)].copy()
-                if catalyst_horizon else catalysts.copy()
-            )
-            catalyst_url = news_frame_column(catalyst_view, "URL")
-            column_config = {catalyst_url: st.column_config.LinkColumn("Source")} if catalyst_url else None
-            st.dataframe(
-                catalyst_view, use_container_width=True, hide_index=True, column_config=column_config
-            )
-            show_download("Download catalyst headlines", catalyst_view, "news_catalyst_headlines.csv")
-        st.link_button("Open Zerodha Pulse manually", "https://pulse.zerodha.com/")
-        st.caption("Pulse is a manual reference only. This project does not crawl or reverse-engineer it.")
-        if not drivers.empty:
-            driver_horizon = news_frame_column(drivers, "Horizon")
-            driver_view = (
-                drivers[drivers[driver_horizon].astype(str).eq(horizon)].copy()
-                if driver_horizon else drivers.copy()
-            )
-            with st.expander("Model feature contributions", expanded=False):
-                st.dataframe(driver_view, use_container_width=True, hide_index=True)
-
-    with views[2]:
-        if features.empty:
-            st.info("No saved market-context features are available.")
-        else:
-            feature_index = news_frame_column(features, "Index", "Index Name")
-            selected = set(ranked.head(top_count)[index_column]) if index_column else set()
-            context = features[features[feature_index].isin(selected)] if feature_index and selected else features
-            st.dataframe(format_percent_columns(context), use_container_width=True, hide_index=True)
-
-    with views[3]:
-        if metrics.empty:
-            st.info("Model evaluation appears after the first historical training run.")
-        else:
-            st.dataframe(format_percent_columns(metrics), use_container_width=True, hide_index=True)
-            show_download("Download model metrics", metrics, "news_model_metrics.csv")
-        if not evaluation.empty:
-            evaluation_horizon = news_frame_column(evaluation, "Horizon")
-            actual = news_frame_column(evaluation, "Actual Excess Return %", "Actual Excess Return Pct")
-            predicted = news_frame_column(
-                evaluation, "Predicted Excess Return %", "Predicted Excess Return Pct"
-            )
-            evaluation_view = (
-                evaluation[evaluation[evaluation_horizon].astype(str).eq(horizon)].copy()
-                if evaluation_horizon else evaluation.copy()
-            )
-            if actual and predicted and not evaluation_view.empty:
-                scatter = px.scatter(
-                    evaluation_view,
-                    x=predicted,
-                    y=actual,
-                    color=news_frame_column(evaluation_view, "Index", "Index Name"),
-                    opacity=0.55,
-                    title="Untouched Test: Predicted Versus Realized Excess Return",
-                )
-                scatter.add_hline(y=0, line_dash="dot", line_color="#777777")
-                scatter.add_vline(x=0, line_dash="dot", line_color="#777777")
-                st.plotly_chart(scatter, use_container_width=True)
-
-    with views[4]:
-        st.dataframe(jobs, use_container_width=True, hide_index=True) if not jobs.empty else st.info(
-            "No job history is available."
-        )
-    with views[5]:
-        st.dataframe(eligibility, use_container_width=True, hide_index=True)
-        show_download("Download index eligibility", eligibility, "news_index_eligibility.csv")
-
-    with st.expander("News data services"):
-        st.dataframe(news_environment_status(), use_container_width=True, hide_index=True)
-        st.caption(
-            "Historical news uses the free BigQuery Sandbox with dry-run cost guards and resumable daily "
-            "checkpoints. Incremental news uses GDELT and configured permitted RSS feeds. Models and "
-            "Parquet archives live in private Supabase storage."
-        )
-
 
 def build_config() -> tuple[ScreeningConfig, str]:
     st.sidebar.header("Inputs")
@@ -708,15 +416,19 @@ if not Path(csv_path).exists():
 
 if refresh_momentum:
     progress = make_progress("Downloading yfinance data")
-    momentum = run_momentum(
-        csv_path,
-        config,
-        progress_callback=progress,
-        output_dir=OUTPUT_DIR,
-        use_saved_returns=False,
-    )
-    st.session_state["results"] = empty_results(momentum)
-    st.success(f"Momentum complete: {len(momentum):,} stocks passed the short-term return filter.")
+    try:
+        momentum = run_momentum(
+            csv_path,
+            config,
+            progress_callback=progress,
+            output_dir=OUTPUT_DIR,
+            use_saved_returns=False,
+        )
+    except Exception as exc:
+        st.error(f"Momentum refresh could not finish: {exc}")
+    else:
+        st.session_state["results"] = empty_results(momentum)
+        st.success(f"Momentum complete: {len(momentum):,} stocks passed the short-term return filter.")
 
 if use_saved_momentum:
     load_saved_run(config)
@@ -789,7 +501,6 @@ tabs = st.tabs(
         "DII Accumulation",
         "Quarterly Results",
         "Index Momentum",
-        "News Catalysts",
         "CSV Stock Momentum",
         "Correlation",
         "200DMA Finder",
@@ -1474,10 +1185,6 @@ with tabs[7]:
                 show_download("Download index data health", index_health, "index_momentum_health.csv")
 
 with tabs[8]:
-    render_news_catalysts()
-
-
-with tabs[9]:
     st.subheader("CSV Stock Momentum")
     st.caption(
         "After identifying a strong index, upload its constituent tickers here. The file may contain Ticker, Ticker Name, Symbol, NSE Symbol, or just one ticker column."
@@ -1589,7 +1296,7 @@ with tabs[9]:
             show_download("Download uploaded stock data health", custom_health, "custom_stock_health.csv")
 
 
-with tabs[10]:
+with tabs[9]:
     st.subheader("Macro Factor Correlation")
     st.caption(
         "Historical stock-return relationships with crude oil, gold, sovereign yields, and USD/INR. "
@@ -1935,7 +1642,7 @@ with tabs[10]:
         )
 
 
-with tabs[11]:
+with tabs[10]:
     st.subheader("200DMA Opportunity Finder")
     st.caption(
         "Find fundamentally strong stocks trading just above their 200-day moving average. "

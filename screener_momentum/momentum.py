@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from datetime import date, timedelta
 from pathlib import Path
-from tempfile import gettempdir
 
 import numpy as np
 import pandas as pd
@@ -12,7 +11,9 @@ import yfinance as yf
 from .config import RETURN_PERIODS
 
 
-_YFINANCE_CACHE = Path(gettempdir()) / "momentum_screener_yfinance_cache"
+# Keep yfinance's SQLite caches beside the app output. Some hosted and sandboxed
+# environments expose a temporary directory that exists but cannot host SQLite WAL files.
+_YFINANCE_CACHE = Path(__file__).resolve().parents[1] / "output" / ".yfinance_cache"
 _YFINANCE_CACHE.mkdir(parents=True, exist_ok=True)
 yf.set_tz_cache_location(str(_YFINANCE_CACHE))
 
@@ -31,30 +32,38 @@ def download_adjusted_close(
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> pd.DataFrame:
     """Download adjusted close series in batches and return one column per ticker."""
+    yahoo_tickers = list(dict.fromkeys(str(ticker).upper() for ticker in yahoo_tickers))
     closes: list[pd.DataFrame] = []
     total = len(yahoo_tickers)
     completed = 0
     for batch in chunked(yahoo_tickers, batch_size):
         if progress_callback:
             progress_callback(completed, total, f"Downloading prices for {batch[0]} to {batch[-1]}")
-        download_options: dict[str, object] = {
-            "tickers": batch,
-            "auto_adjust": True,
-            "group_by": "ticker",
-            "threads": True,
-            "progress": False,
-        }
-        if start_date is not None or end_date is not None:
-            if start_date is not None:
-                download_options["start"] = start_date.isoformat()
-            if end_date is not None:
-                download_options["end"] = (end_date + timedelta(days=1)).isoformat()
-        else:
-            download_options["period"] = period
-        data = yf.download(**download_options)
-        close = _extract_close(data, batch)
+        close = _download_close_batch(batch, period, start_date, end_date, threads=True)
         if not close.empty:
             closes.append(close)
+
+        downloaded = {
+            column for column in close.columns if close[column].notna().any()
+        } if not close.empty else set()
+        missing = [ticker for ticker in batch if ticker not in downloaded]
+        if missing:
+            if progress_callback:
+                progress_callback(
+                    completed,
+                    total,
+                    f"Retrying {len(missing):,} missing ticker(s) in smaller groups",
+                )
+            for retry_batch in chunked(missing, 10):
+                retry_close = _download_close_batch(
+                    retry_batch,
+                    period,
+                    start_date,
+                    end_date,
+                    threads=False,
+                )
+                if not retry_close.empty:
+                    closes.append(retry_close)
         completed = min(completed + len(batch), total)
         if progress_callback:
             progress_callback(completed, total, f"Downloaded {completed:,} of {total:,} tickers")
@@ -63,7 +72,36 @@ def download_adjusted_close(
         return pd.DataFrame()
 
     merged = pd.concat(closes, axis=1)
-    return merged.loc[:, ~merged.columns.duplicated()].sort_index()
+    if merged.columns.duplicated().any():
+        merged = merged.T.groupby(level=0).first().T
+    return merged.sort_index()
+
+
+def _download_close_batch(
+    tickers: list[str],
+    period: str,
+    start_date: date | None,
+    end_date: date | None,
+    threads: bool,
+) -> pd.DataFrame:
+    download_options: dict[str, object] = {
+        "tickers": tickers,
+        "auto_adjust": True,
+        "group_by": "ticker",
+        "threads": threads,
+        "progress": False,
+    }
+    if start_date is not None or end_date is not None:
+        if start_date is not None:
+            download_options["start"] = start_date.isoformat()
+        if end_date is not None:
+            download_options["end"] = (end_date + timedelta(days=1)).isoformat()
+    else:
+        download_options["period"] = period
+    try:
+        return _extract_close(yf.download(**download_options), tickers)
+    except Exception:
+        return pd.DataFrame()
 
 
 def _extract_close(data: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
