@@ -65,6 +65,8 @@ from screener_momentum.sma200 import sma200_chart_data
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_TICKER_FILE = ROOT / "ticker.csv"
+CORRELATION_TICKER_FILE = ROOT / "correlation_universe.csv"
+CORRELATION_UNIVERSE_NAME = "NSE Nifty 500 (04-Sep-2026)"
 OUTPUT_DIR = ROOT / "output" / "latest"
 
 st.set_page_config(
@@ -1299,8 +1301,15 @@ with tabs[8]:
 with tabs[9]:
     st.subheader("Macro Factor Correlation")
     st.caption(
-        "Historical stock-return relationships with crude oil, gold, sovereign yields, and USD/INR. "
+        "Historical stock-return relationships for the fixed NSE Nifty 500 universe supplied on 4 September 2026. "
         "Price factors use percentage changes; yields use basis-point changes."
+    )
+    correlation_universe = read_csv_if_exists(CORRELATION_TICKER_FILE)
+    st.caption(
+        f"Correlation universe: {CORRELATION_UNIVERSE_NAME} | "
+        f"{correlation_universe['Ticker'].nunique():,} stocks"
+        if not correlation_universe.empty and "Ticker" in correlation_universe
+        else f"Correlation universe file missing: {CORRELATION_TICKER_FILE.name}"
     )
 
     selected_correlation_factors = st.multiselect(
@@ -1377,11 +1386,14 @@ with tabs[9]:
     if run_correlation:
         if not selected_correlation_factors:
             st.error("Select at least one macro factor.")
+        elif correlation_universe.empty:
+            st.error(f"Correlation universe file not found or empty: {CORRELATION_TICKER_FILE}")
         else:
             correlation_progress = make_progress("Downloading as-of market history and calculating relationships")
             try:
                 st.session_state["correlation_results"] = run_correlation_screen(
-                    ticker_csv=csv_path,
+                    ticker_csv=CORRELATION_TICKER_FILE,
+                    universe_name=CORRELATION_UNIVERSE_NAME,
                     factors=selected_correlation_factors,
                     end_date=correlation_end_date,
                     lookback_years=int(correlation_lookback),
@@ -1394,13 +1406,16 @@ with tabs[9]:
                     progress_callback=correlation_progress,
                     output_dir=OUTPUT_DIR,
                 )
-                st.success("Full-universe correlation scan and saved-run checkpoint are ready.")
+                st.success("Nifty 500 correlation scan and saved-run checkpoint are ready.")
             except Exception as exc:
                 st.error(f"Correlation scan could not complete: {exc}")
 
     if use_saved_correlation:
         try:
-            st.session_state["correlation_results"] = load_saved_correlation(OUTPUT_DIR)
+            st.session_state["correlation_results"] = load_saved_correlation(
+                OUTPUT_DIR,
+                expected_universe_name=CORRELATION_UNIVERSE_NAME,
+            )
             st.success("Loaded the saved prices, factors, correlation results, and ridge model.")
         except FileNotFoundError as exc:
             st.error(str(exc))
@@ -1415,7 +1430,7 @@ with tabs[9]:
     correlation_stale = bool(correlation_results.get("stale", False))
 
     if correlation_all.empty:
-        st.info("Run the full-universe scan or recover a completed correlation run.")
+        st.info("Run the Nifty 500 scan or recover a completed Nifty 500 correlation run.")
     else:
         available_factors = correlation_all["Factor"].dropna().astype(str).unique().tolist()
         if correlation_stale:
@@ -1425,6 +1440,7 @@ with tabs[9]:
             saved_row = correlation_metadata.iloc[0]
             st.caption(
                 f"Saved run: {saved_row.get('Saved At UTC', 'unknown')} | "
+                f"{saved_row.get('Universe Name', 'unknown universe')} | "
                 f"{saved_row.get('Requested Frequency', 'unknown')} | "
                 f"{saved_row.get('Relationship', 'unknown')} | "
                 f"Ridge alpha {saved_row.get('Ridge Alpha', 'unknown')}"

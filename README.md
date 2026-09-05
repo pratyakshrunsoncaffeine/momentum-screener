@@ -124,7 +124,9 @@ Saved uploaded-stock files:
 
 ## Macro Factor Correlation
 
-The `Correlation` tab scans the complete `ticker.csv` universe against Brent crude, gold, the US 10-year yield, the India 10-year yield, and USD/INR. Every fresh run downloads stock history only through the selected analysis date, so a later run automatically rolls the historical window forward without using dates after the requested cutoff.
+The `Correlation` tab scans the fixed 500-stock universe in `correlation_universe.csv` against Brent crude, gold, the US 10-year yield, the India 10-year yield, and USD/INR. This universe is the deduplicated union of the supplied Nifty 500, Nifty MidSmallcap 400, Nifty Midcap 150, and Nifty Smallcap 250 constituent files dated 4 September 2026. The latter three are subsets of Nifty 500, so the final universe contains exactly 500 stocks.
+
+This correlation-only universe does not change the full `ticker.csv` used by the other screeners. Every fresh run downloads stock history only through the selected analysis date, so a later run automatically rolls the historical window forward without using dates after the requested cutoff. Saved correlation runs record their universe name, and legacy 3,000-stock runs are not loaded into this view.
 
 Brent, gold, and USD/INR use percentage price changes. Sovereign yields use basis-point changes because percentage returns on yield levels are not economically comparable. The public India 10-year FRED/OECD series is monthly; the dashboard labels that effective frequency even when the other selected factors use daily or weekly observations.
 

@@ -703,6 +703,7 @@ def run_correlation_screen(
     ticker_csv: str | Path,
     factors: list[str] | tuple[str, ...],
     end_date: date,
+    universe_name: str = "Custom ticker CSV",
     lookback_years: int = 3,
     frequency: str = "Weekly",
     method: str = "Pearson",
@@ -853,12 +854,14 @@ def run_correlation_screen(
     health["Relation"] = relation
     health["Method"] = method
     health["Analysis End Date"] = end_date.isoformat()
+    health["Universe Name"] = universe_name
     health["Ticker Universe"] = len(universe)
     health["Stocks With Prices"] = int(prices.notna().any(axis=0).sum())
     metadata = pd.DataFrame(
         [
             {
                 "Saved At UTC": pd.Timestamp.now(tz="UTC").isoformat(),
+                "Universe Name": universe_name,
                 "Analysis End Date": end_date.isoformat(),
                 "Lookback Years": years,
                 "Requested Frequency": frequency,
@@ -900,6 +903,7 @@ def run_correlation_screen(
 
 def load_saved_correlation(
     output_dir: str | Path = "output/latest",
+    expected_universe_name: str | None = None,
 ) -> dict[str, object]:
     """Recover the most recent completed correlation scan without another market-data request."""
     paths = output_paths(output_dir)
@@ -911,6 +915,14 @@ def load_saved_correlation(
     metadata = _read_saved_frame(paths["correlation_run_metadata"])
     if results.empty:
         raise FileNotFoundError("No saved correlation scan is available yet.")
+    saved_universe_name = (
+        str(metadata.iloc[0].get("Universe Name", "")) if not metadata.empty else ""
+    )
+    if expected_universe_name and saved_universe_name != expected_universe_name:
+        raise FileNotFoundError(
+            "The saved correlation run belongs to the previous stock universe. "
+            "Run the Nifty 500 correlation scan once to replace it."
+        )
     positive = _read_saved_frame(paths["correlation_top_positive"])
     inverse = _read_saved_frame(paths["correlation_top_negative"])
     if positive.empty and inverse.empty:
@@ -953,6 +965,7 @@ def load_saved_correlation(
             [
                 {
                     "Saved At UTC": pd.Timestamp.now(tz="UTC").isoformat(),
+                    "Universe Name": "Legacy saved universe",
                     "Analysis End Date": results.get("Data End", pd.Series([""])).max(),
                     "Lookback Years": "",
                     "Requested Frequency": results.get("Effective Frequency", pd.Series([""])).mode().iloc[0],
