@@ -20,6 +20,7 @@ from screener_momentum.config import (
     DEFAULT_MOMENTUM_WEIGHTS,
     DEFAULT_POSITIVE_RETURN_FILTERS,
     FundamentalThresholds,
+    QualityMomentumConfig,
     ScreeningConfig,
     Sma200ScanConfig,
 )
@@ -37,6 +38,7 @@ from screener_momentum.pipeline import (
     load_saved_sma200_results,
     load_saved_index_momentum,
     load_saved_custom_stock_momentum,
+    load_saved_quality_momentum,
     load_saved_returns,
     output_paths,
     prepare_dii_all,
@@ -52,6 +54,7 @@ from screener_momentum.pipeline import (
     rescore_saved_index_momentum,
     reset_index_momentum_scan,
     run_custom_stock_momentum,
+    run_quality_momentum_screen,
     run_sma200_screen,
     run_momentum,
     reset_dii_momentum_scan,
@@ -67,6 +70,7 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_TICKER_FILE = ROOT / "ticker.csv"
 CORRELATION_TICKER_FILE = ROOT / "correlation_universe.csv"
 CORRELATION_UNIVERSE_NAME = "NSE Nifty 500 (04-Sep-2026)"
+QUALITY_MOMENTUM_TICKER_FILE = ROOT / "quality_momentum_universe.csv"
 OUTPUT_DIR = ROOT / "output" / "latest"
 
 st.set_page_config(
@@ -505,6 +509,7 @@ tabs = st.tabs(
         "Index Momentum",
         "CSV Stock Momentum",
         "Correlation",
+        "Quality Momentum",
         "200DMA Finder",
     ]
 )
@@ -1659,6 +1664,183 @@ with tabs[9]:
 
 
 with tabs[10]:
+    st.subheader("Quality Momentum")
+    st.caption(
+        "Price-first trendline momentum for the supplied Nifty MidSmallcap 400 universe. "
+        "Only the top price-qualified decile proceeds to Screener.in ownership, pledge, business-quality, and NSE surveillance checks."
+    )
+    quality_upload = st.file_uploader(
+        "Optional replacement ticker CSV",
+        type=["csv"],
+        key="quality_momentum_upload",
+        help="Upload a Ticker, Ticker Name, Symbol, NSE Symbol, or single-column ticker file.",
+    )
+    quality_csv_path = str(QUALITY_MOMENTUM_TICKER_FILE)
+    if quality_upload is not None:
+        quality_temp = NamedTemporaryFile(delete=False, suffix=".csv")
+        quality_temp.write(quality_upload.getbuffer())
+        quality_temp.close()
+        quality_csv_path = quality_temp.name
+
+    quality_controls = st.columns(6)
+    quality_min_adtv = quality_controls[0].number_input(
+        "Minimum ADTV (Cr)", 0.1, 100.0, 1.0, 0.5, key="quality_min_adtv"
+    )
+    quality_top_percent = quality_controls[1].slider(
+        "Top momentum %", 1, 30, 10, key="quality_top_percent"
+    )
+    quality_max_rsi = quality_controls[2].number_input(
+        "Maximum RSI", 50.0, 100.0, 78.0, 1.0, key="quality_max_rsi"
+    )
+    quality_max_extension = quality_controls[3].number_input(
+        "Maximum above SMA50 %", 5.0, 100.0, 25.0, 1.0, key="quality_max_extension"
+    )
+    quality_max_pledge = quality_controls[4].number_input(
+        "Maximum promoter pledge %", 0.0, 100.0, 20.0, 1.0, key="quality_max_pledge"
+    )
+    quality_max_institutional_drop = quality_controls[5].number_input(
+        "Maximum FII+DII fall (pp)", 0.0, 20.0, 2.0, 0.5, key="quality_max_institutional_drop"
+    )
+    quality_secondary = st.columns(4)
+    quality_lookback = quality_secondary[0].slider(
+        "Trendline lookback (days)", 63, 252, 126, 21, key="quality_lookback"
+    )
+    quality_high_proximity = quality_secondary[1].number_input(
+        "Near 52-week high %", 0.5, 10.0, 2.0, 0.5, key="quality_high_proximity"
+    )
+    quality_vertical_return = quality_secondary[2].number_input(
+        "Vertical-surge 21D return %", 10.0, 100.0, 25.0, 5.0, key="quality_vertical_return"
+    )
+    quality_batch_size = quality_secondary[3].slider(
+        "Yahoo batch size", 10, 100, 50, 10, key="quality_batch_size"
+    )
+    quality_config = QualityMomentumConfig(
+        trend_lookback_days=int(quality_lookback),
+        min_average_traded_value_cr=float(quality_min_adtv),
+        top_percent=float(quality_top_percent),
+        max_rsi=float(quality_max_rsi),
+        max_sma50_extension_pct=float(quality_max_extension),
+        high_proximity_pct=float(quality_high_proximity),
+        vertical_surge_return_pct=float(quality_vertical_return),
+        max_promoter_pledge_pct=float(quality_max_pledge),
+        max_combined_institutional_drop_pct=float(quality_max_institutional_drop),
+        price_batch_size=int(quality_batch_size),
+    )
+
+    quality_actions = st.columns(3)
+    run_quality = quality_actions[0].button(
+        "Run / Resume Quality Momentum", type="primary", use_container_width=True
+    )
+    restart_quality = quality_actions[1].button(
+        "Run Full Scan From Beginning", use_container_width=True, key="restart_quality_momentum"
+    )
+    use_saved_quality = quality_actions[2].button(
+        "Use Saved Quality Momentum", use_container_width=True
+    )
+
+    if run_quality or restart_quality:
+        quality_price_progress = make_progress("Downloading prices and calculating quality momentum")
+        quality_verification_progress = make_progress("Checking Screener.in fundamentals and ownership")
+        try:
+            st.session_state["quality_momentum_results"] = run_quality_momentum_screen(
+                ticker_csv=quality_csv_path,
+                config=quality_config,
+                price_progress_callback=quality_price_progress,
+                verification_progress_callback=quality_verification_progress,
+                output_dir=OUTPUT_DIR,
+                resume=not restart_quality,
+                restart=restart_quality,
+            )
+            st.success("Quality Momentum scan completed and all recovery files were saved.")
+        except Exception as exc:
+            st.error(f"Quality Momentum scan stopped: {exc}")
+            try:
+                st.session_state["quality_momentum_results"] = load_saved_quality_momentum(OUTPUT_DIR)
+                st.warning("Recovered the most recent completed Quality Momentum stage.")
+            except FileNotFoundError:
+                pass
+
+    if use_saved_quality:
+        try:
+            st.session_state["quality_momentum_results"] = load_saved_quality_momentum(OUTPUT_DIR)
+            st.success("Loaded the saved Quality Momentum scan without downloading again.")
+        except FileNotFoundError as exc:
+            st.error(str(exc))
+
+    quality_results = st.session_state.get("quality_momentum_results", {})
+    quality_metrics = quality_results.get("metrics", pd.DataFrame()).copy()
+    quality_shortlist = quality_results.get("shortlist", pd.DataFrame()).copy()
+    quality_verified = quality_results.get("verified", pd.DataFrame()).copy()
+    quality_final = quality_results.get("final", pd.DataFrame()).copy()
+    quality_rejected = quality_results.get("rejected", pd.DataFrame()).copy()
+    quality_health = quality_results.get("health", pd.DataFrame()).copy()
+    quality_stale = bool(quality_results.get("stale", False))
+
+    if quality_metrics.empty:
+        default_count = len(read_csv_if_exists(QUALITY_MOMENTUM_TICKER_FILE))
+        st.info(
+            f"Ready to scan the supplied {default_count:,}-stock Nifty MidSmallcap universe. "
+            "A replacement ticker CSV can be uploaded above."
+        )
+    else:
+        if quality_stale:
+            st.warning("Showing a saved Quality Momentum run. Check Data Health for its source dates.")
+        quality_pending = (
+            int(quality_verified.get("Quality Status", pd.Series(dtype=str)).eq("Pending verification").sum())
+            if not quality_verified.empty else 0
+        )
+        quality_price_pass = int(quality_metrics.get("Price Filter Pass", pd.Series(dtype=bool)).fillna(False).sum())
+        quality_summary = st.columns(5)
+        quality_summary[0].metric("Universe", f"{len(quality_metrics):,}")
+        quality_summary[1].metric("Price Qualified", f"{quality_price_pass:,}")
+        quality_summary[2].metric("Top-Decile Shortlist", f"{len(quality_shortlist):,}")
+        quality_summary[3].metric("Final Qualified", f"{len(quality_final):,}")
+        quality_summary[4].metric("Pending Verification", f"{quality_pending:,}")
+
+        if not quality_shortlist.empty:
+            quality_chart = px.bar(
+                quality_shortlist.head(20).sort_values("Trendline Momentum Score"),
+                x="Trendline Momentum Score",
+                y="Ticker",
+                orientation="h",
+                color="Trend R Squared",
+                color_continuous_scale="Tealgrn",
+                hover_data=["Name", "Average Daily Traded Value Cr", "RSI 14", "21D Return %"],
+                title="Top Price-Qualified Trendline Momentum",
+            )
+            st.plotly_chart(quality_chart, use_container_width=True)
+
+        quality_views = st.tabs(
+            ["Final Opportunities", "Live Verification", "Price Shortlist", "All Price Metrics", "Rejected", "Data Health"]
+        )
+        with quality_views[0]:
+            if quality_final.empty:
+                st.info("No company has passed every price, quality, ownership, freshness, and surveillance check yet.")
+            else:
+                st.dataframe(format_percent_columns(quality_final), use_container_width=True, hide_index=True)
+                show_download("Download final Quality Momentum opportunities", quality_final, "quality_momentum_final.csv")
+        with quality_views[1]:
+            st.dataframe(format_percent_columns(quality_verified), use_container_width=True, hide_index=True)
+            show_download("Download live verification", quality_verified, "quality_momentum_verified.csv")
+        with quality_views[2]:
+            st.dataframe(format_percent_columns(quality_shortlist), use_container_width=True, hide_index=True)
+            show_download("Download price shortlist", quality_shortlist, "quality_momentum_shortlist.csv")
+        with quality_views[3]:
+            st.dataframe(format_percent_columns(quality_metrics), use_container_width=True, hide_index=True)
+            show_download("Download all quality price metrics", quality_metrics, "quality_momentum_metrics.csv")
+        with quality_views[4]:
+            st.dataframe(format_percent_columns(quality_rejected), use_container_width=True, hide_index=True)
+            show_download("Download rejected companies", quality_rejected, "quality_momentum_rejected.csv")
+        with quality_views[5]:
+            st.dataframe(quality_health, use_container_width=True, hide_index=True)
+            show_download("Download Quality Momentum data health", quality_health, "quality_momentum_health.csv")
+            st.caption(
+                "Final qualification fails closed when current NSE surveillance, symbol/ISIN, pledge, "
+                "or two-quarter FII/DII verification is unavailable. Stage I surveillance remains visibly flagged."
+            )
+
+
+with tabs[11]:
     st.subheader("200DMA Opportunity Finder")
     st.caption(
         "Find fundamentally strong stocks trading just above their 200-day moving average. "

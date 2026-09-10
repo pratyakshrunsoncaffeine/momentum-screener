@@ -119,6 +119,28 @@ class Sma200ScanConfig:
 
 
 @dataclass(frozen=True)
+class QualityMomentumConfig:
+    trend_lookback_days: int = 126
+    score_comparison_days: int = 21
+    liquidity_days: int = 21
+    min_average_traded_value_cr: float = 1.0
+    top_percent: float = 10.0
+    sma_fast_days: int = 50
+    sma_slow_days: int = 200
+    rsi_days: int = 14
+    max_rsi: float = 78.0
+    max_sma50_extension_pct: float = 25.0
+    high_lookback_days: int = 252
+    high_proximity_pct: float = 2.0
+    vertical_surge_return_pct: float = 25.0
+    max_promoter_pledge_pct: float = 20.0
+    max_combined_institutional_drop_pct: float = 2.0
+    max_quote_age_days: int = 3
+    max_shareholding_age_days: int = 185
+    price_batch_size: int = 50
+
+
+@dataclass(frozen=True)
 class ScreeningConfig:
     momentum_weights: dict[str, float] = field(default_factory=lambda: DEFAULT_MOMENTUM_WEIGHTS.copy())
     positive_return_filters: tuple[str, ...] = DEFAULT_POSITIVE_RETURN_FILTERS

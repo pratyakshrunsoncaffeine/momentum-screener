@@ -9,7 +9,7 @@ This project screens NSE stocks from `ticker.csv` in four stages:
 
 The dashboard also backtests a portfolio invested in the top 10 final companies: 70% split across the top 5 and 30% split across the next 5, compared against Nifty 50 and a Nifty Midcap benchmark where Yahoo Finance data is available.
 
-It also includes independent FII, DII, quarterly-results, post-earnings stock-return, NSE index momentum, uploaded-stock momentum, macro correlation, and 200DMA opportunity workflows. Each long-running scanner writes checkpoints so a Streamlit refresh does not discard completed work.
+It also includes independent FII, DII, quarterly-results, post-earnings stock-return, NSE index momentum, uploaded-stock momentum, macro correlation, Quality Momentum, and 200DMA opportunity workflows. Each long-running scanner writes checkpoints so a Streamlit refresh does not discard completed work.
 
 The portfolio tab uses a monthly walk-forward price backtest. Each month it recalculates momentum using only price data available before that rebalance date, invests for one month, then reinvests the ending capital into the next month's selected portfolio. If fundamentals are applied, the historical backtest uses the current fundamentals-passed universe as a static filter, so it avoids price lookahead but still has current-fundamentals bias.
 
@@ -186,6 +186,29 @@ Saved 200DMA files:
 - `output/latest/sma200_backtest_periods.csv`
 - `output/latest/sma200_current_allocation.csv`
 - `output/latest/sma200_backtest_summary.csv`
+
+## Quality Momentum
+
+The `Quality Momentum` tab runs a staged trend-quality screen on the bundled Nifty MidSmallcap 400 universe or on a ticker-only CSV uploaded in the dashboard.
+
+1. Yahoo Finance prices and volumes are used to calculate average daily traded value, RSI, 50-day and 200-day averages, price extension, 52-week-high distance, and 21-day return.
+2. Trendline momentum is the annualized slope of log prices multiplied by the regression R-squared, rewarding both trend strength and consistency.
+3. Illiquid, weakening, overextended, vertical-surge, and structurally weak price trends are rejected before any website scraping.
+4. The top configurable percentage of price-qualified stocks is checked through Screener.in for promoter pledge, quarterly business deterioration, and two complete quarters of combined FII and DII ownership.
+5. NSE's security master verifies symbol and ISIN. Current surveillance reports are checked when available; a missing report remains `Pending Verification` instead of silently passing.
+6. The latest quote is used for a final `price > SMA50 > SMA200` trend confirmation.
+
+Every stage is checkpointed under `output/latest`. The dashboard provides final qualified opportunities, all shortlisted companies, exact rejection reasons, and a data freshness/source report. Use `Run Full Scan From Beginning` when a completely fresh price, fundamental, and governance check is required.
+
+Saved Quality Momentum files:
+
+- `output/latest/quality_momentum_metrics.csv`
+- `output/latest/quality_momentum_shortlist.csv`
+- `output/latest/quality_momentum_fundamentals_partial.csv`
+- `output/latest/quality_momentum_verified.csv`
+- `output/latest/quality_momentum_final.csv`
+- `output/latest/quality_momentum_rejected.csv`
+- `output/latest/quality_momentum_health.csv`
 
 ## Local Setup
 

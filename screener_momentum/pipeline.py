@@ -21,6 +21,7 @@ from .config import (
     DEFAULT_POST_EARNINGS_STOCK_RETURN_WEIGHTS,
     POST_EARNINGS_STOCK_RETURN_PERIODS,
     FundamentalThresholds,
+    QualityMomentumConfig,
     ScreeningConfig,
     Sma200ScanConfig,
     RETURN_PERIODS,
@@ -33,6 +34,14 @@ from .fundamentals import (
     screen_quarterly_results,
 )
 from .momentum import calculate_returns, download_adjusted_close, score_momentum
+from .quality_momentum import (
+    NseQualityReferenceProvider,
+    build_quality_rejections,
+    calculate_quality_price_metrics,
+    download_quality_history,
+    screen_quality_fundamentals,
+    verify_latest_trend,
+)
 from .index_momentum import (
     DEFAULT_INDEX_MOMENTUM_WEIGHTS,
     INDEX_MOMENTUM_PERIODS,
@@ -125,6 +134,17 @@ def output_paths(output_dir: str | Path = "output/latest") -> dict[str, Path]:
         "sma200_backtest_periods": root / "sma200_backtest_periods.csv",
         "sma200_current_allocation": root / "sma200_current_allocation.csv",
         "sma200_backtest_summary": root / "sma200_backtest_summary.csv",
+        "quality_momentum_cache": root.parent / "quality_momentum_cache",
+        "quality_momentum_input": root / "quality_momentum_input.csv",
+        "quality_momentum_prices": root / "quality_momentum_prices.csv",
+        "quality_momentum_volumes": root / "quality_momentum_volumes.csv",
+        "quality_momentum_metrics": root / "quality_momentum_metrics.csv",
+        "quality_momentum_shortlist": root / "quality_momentum_shortlist.csv",
+        "quality_momentum_fundamentals_partial": root / "quality_momentum_fundamentals_partial.csv",
+        "quality_momentum_verified": root / "quality_momentum_verified.csv",
+        "quality_momentum_final": root / "quality_momentum_final.csv",
+        "quality_momentum_rejected": root / "quality_momentum_rejected.csv",
+        "quality_momentum_health": root / "quality_momentum_health.csv",
     }
 
 
@@ -995,6 +1015,177 @@ def load_saved_correlation(
         "metadata": metadata,
         "stale": True,
     }
+
+
+def reset_quality_momentum_scan(output_dir: str | Path = "output/latest") -> None:
+    """Clear only Quality Momentum outputs and reference caches."""
+    paths = output_paths(output_dir)
+    for key in (
+        "quality_momentum_input",
+        "quality_momentum_prices",
+        "quality_momentum_volumes",
+        "quality_momentum_metrics",
+        "quality_momentum_shortlist",
+        "quality_momentum_fundamentals_partial",
+        "quality_momentum_verified",
+        "quality_momentum_final",
+        "quality_momentum_rejected",
+        "quality_momentum_health",
+    ):
+        paths[key].unlink(missing_ok=True)
+    if paths["quality_momentum_cache"].exists():
+        shutil.rmtree(paths["quality_momentum_cache"])
+
+
+def run_quality_momentum_screen(
+    ticker_csv: str | Path,
+    config: QualityMomentumConfig,
+    price_progress_callback: ProgressCallback | None = None,
+    verification_progress_callback: ProgressCallback | None = None,
+    output_dir: str | Path = "output/latest",
+    resume: bool = True,
+    restart: bool = False,
+) -> dict[str, object]:
+    """Run the price-first Quality Momentum screen and checkpoint every stage."""
+    paths = output_paths(output_dir)
+    if restart:
+        reset_quality_momentum_scan(output_dir)
+    universe = load_ticker_universe(ticker_csv)
+    save_frame(universe, paths["quality_momentum_input"])
+
+    closes = _load_quality_wide(paths["quality_momentum_prices"])
+    volumes = _load_quality_wide(paths["quality_momentum_volumes"])
+    requested = set(universe["YFinance Ticker"].astype(str))
+    available = set(closes.columns) & set(volumes.columns)
+    latest_price_date = closes.index.max().date() if not closes.empty else None
+    cached_prices_are_current = (
+        resume
+        and latest_price_date is not None
+        and (date.today() - latest_price_date).days <= config.max_quote_age_days
+    )
+    missing_tickers = sorted(requested - available) if cached_prices_are_current else []
+    reused_with_retry = False
+    if cached_prices_are_current and missing_tickers:
+        missing_closes, missing_volumes = download_quality_history(
+            missing_tickers,
+            batch_size=config.price_batch_size,
+            progress_callback=price_progress_callback,
+        )
+        closes = pd.concat([missing_closes, closes], axis=1).T.groupby(level=0).first().T
+        volumes = pd.concat([missing_volumes, volumes], axis=1).T.groupby(level=0).first().T
+        reused_with_retry = True
+        save_frame(closes.rename_axis("Date").reset_index(), paths["quality_momentum_prices"])
+        save_frame(volumes.rename_axis("Date").reset_index(), paths["quality_momentum_volumes"])
+    elif not cached_prices_are_current:
+        closes, volumes = download_quality_history(
+            universe["YFinance Ticker"].astype(str).tolist(),
+            batch_size=config.price_batch_size,
+            progress_callback=price_progress_callback,
+        )
+        if closes.empty:
+            raise RuntimeError("Yahoo Finance returned no quality-momentum price history.")
+        save_frame(closes.rename_axis("Date").reset_index(), paths["quality_momentum_prices"])
+        save_frame(volumes.rename_axis("Date").reset_index(), paths["quality_momentum_volumes"])
+
+    metrics = calculate_quality_price_metrics(universe, closes, volumes, config)
+    save_frame(metrics, paths["quality_momentum_metrics"])
+    shortlist = metrics.loc[metrics["Price Stage Pass"].fillna(False)].copy()
+    save_frame(shortlist, paths["quality_momentum_shortlist"])
+
+    reference_provider = NseQualityReferenceProvider(paths["quality_momentum_cache"])
+    security_master, surveillance, reference_health = reference_provider.fetch(date.today())
+    verified_fundamentals = screen_quality_fundamentals(
+        shortlist,
+        security_master,
+        surveillance,
+        config,
+        progress_callback=verification_progress_callback,
+        checkpoint_path=paths["quality_momentum_fundamentals_partial"],
+        resume=resume and not restart,
+    )
+    latest_closes, _ = download_quality_history(
+        shortlist["YFinance Ticker"].astype(str).tolist(),
+        batch_size=10,
+        period="1y",
+        progress_callback=price_progress_callback,
+    ) if not shortlist.empty else (pd.DataFrame(), pd.DataFrame())
+    verified = verify_latest_trend(verified_fundamentals, latest_closes, config)
+    final = verified.loc[verified["Final Pass"].fillna(False)].copy()
+    rejected = build_quality_rejections(metrics, verified)
+
+    price_available = int(closes.notna().any().sum()) if not closes.empty else 0
+    price_date = closes.index.max().date().isoformat() if not closes.empty else ""
+    health = pd.concat(
+        [
+            pd.DataFrame(
+                [
+                    {
+                        "Source": "Yahoo Finance adjusted prices and volume",
+                        "Status": (
+                            "saved reuse plus missing-symbol retry"
+                            if reused_with_retry
+                            else ("saved reuse" if cached_prices_are_current else "downloaded")
+                        ),
+                        "Data Date": price_date,
+                        "Rows": len(closes),
+                        "Stocks Requested": len(universe),
+                        "Stocks Available": price_available,
+                        "Message": "",
+                    },
+                    {
+                        "Source": "Screener.in quality verification",
+                        "Status": "complete" if len(verified_fundamentals) == len(shortlist) else "partial",
+                        "Data Date": date.today().isoformat(),
+                        "Rows": len(verified_fundamentals),
+                        "Stocks Requested": len(shortlist),
+                        "Stocks Available": len(verified_fundamentals),
+                        "Message": "Checkpointed after every company.",
+                    },
+                ]
+            ),
+            reference_health,
+        ],
+        ignore_index=True,
+    )
+    save_frame(verified, paths["quality_momentum_verified"])
+    save_frame(final, paths["quality_momentum_final"])
+    save_frame(rejected, paths["quality_momentum_rejected"])
+    save_frame(health, paths["quality_momentum_health"])
+    return {
+        "metrics": metrics,
+        "shortlist": shortlist,
+        "verified": verified,
+        "final": final,
+        "rejected": rejected,
+        "health": health,
+        "stale": False,
+    }
+
+
+def load_saved_quality_momentum(
+    output_dir: str | Path = "output/latest",
+) -> dict[str, object]:
+    paths = output_paths(output_dir)
+    metrics = _read_saved_frame(paths["quality_momentum_metrics"])
+    if metrics.empty:
+        raise FileNotFoundError("No saved Quality Momentum scan is available yet.")
+    return {
+        "metrics": metrics,
+        "shortlist": _read_saved_frame(paths["quality_momentum_shortlist"]),
+        "verified": _read_saved_frame(paths["quality_momentum_verified"]),
+        "final": _read_saved_frame(paths["quality_momentum_final"]),
+        "rejected": _read_saved_frame(paths["quality_momentum_rejected"]),
+        "health": _read_saved_frame(paths["quality_momentum_health"]),
+        "stale": True,
+    }
+
+
+def _load_quality_wide(path: Path) -> pd.DataFrame:
+    frame = _read_saved_frame(path)
+    if frame.empty or "Date" not in frame:
+        return pd.DataFrame()
+    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+    return frame.dropna(subset=["Date"]).set_index("Date").sort_index()
 
 
 def _download_nifty_prices(start_date: date, end_date: date) -> pd.DataFrame:

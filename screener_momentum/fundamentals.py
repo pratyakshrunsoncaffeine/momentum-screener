@@ -389,6 +389,33 @@ def fetch_company_fundamentals(
     }
 
 
+def fetch_company_quality_metrics(
+    symbol: str,
+    session: requests.Session | None = None,
+    timeout: int = 20,
+) -> dict[str, Any]:
+    """Fetch all quality-momentum fundamentals from one Screener company page."""
+    session = session or requests.Session()
+    session.headers.update(HEADERS)
+    url, html = fetch_screener_html(symbol, session=session, timeout=timeout)
+    soup = BeautifulSoup(html, "lxml")
+    fii = extract_fii_holding_change(soup)
+    dii = extract_dii_holding_change(soup)
+    return {
+        "Screener URL": url,
+        "Market Cap Cr": extract_market_cap(soup),
+        "Quarterly Revenue YoY Growth %": extract_latest_quarter_yoy_growth(
+            soup, ("Sales", "Revenue", "Operating Revenue")
+        ),
+        "Quarterly Profit YoY Growth %": extract_latest_quarter_yoy_growth(
+            soup, ("Net Profit", "Profit After Tax", "PAT")
+        ),
+        "Promoter Pledge %": extract_promoter_pledge_pct(soup),
+        **fii,
+        **dii,
+    }
+
+
 def fetch_company_quarterly_results(
     symbol: str,
     target_period: str,
@@ -640,6 +667,42 @@ def extract_promoter_holding_change(soup: BeautifulSoup) -> float | None:
     if len(values) < 2:
         return None
     return round(values[-1] - values[-2], 2)
+
+
+def extract_promoter_pledge_pct(soup: BeautifulSoup) -> float | None:
+    for li in soup.select("#top-ratios li, .company-ratios li"):
+        text = " ".join(li.get_text(" ", strip=True).split())
+        lowered = text.lower()
+        if "pledged percentage" in lowered or "promoter holding pledged" in lowered:
+            return parse_number(text)
+
+    table = section_table(soup, "shareholding")
+    if table is None:
+        return None
+    row = metric_row(table, ("Pledged", "Promoter pledge", "Promoter pledged"))
+    values = numeric_values(row, include_ttm=False)
+    return round(values[-1], 2) if values else None
+
+
+def extract_latest_quarter_yoy_growth(
+    soup: BeautifulSoup,
+    labels: tuple[str, ...],
+) -> float | None:
+    table = section_table(soup, "quarters")
+    if table is None:
+        return None
+    values = numeric_values_with_periods(metric_row(table, labels), include_ttm=False)
+    normalized = [
+        (normalize_quarter_period(period), value)
+        for period, value in values
+        if normalize_quarter_period(period) is not None
+    ]
+    if not normalized:
+        return None
+    latest_period, latest_value = normalized[-1]
+    prior_period = year_ago_quarter_period(latest_period)
+    prior_value = next((value for period, value in normalized if period == prior_period), None)
+    return percentage_growth(latest_value, prior_value)
 
 
 def extract_fii_holding_change(soup: BeautifulSoup) -> dict[str, Any]:
