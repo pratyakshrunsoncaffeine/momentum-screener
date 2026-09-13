@@ -224,7 +224,46 @@ For a CLI run:
 
 Outputs are written to the `output` folder.
 
-## Customization
+## Macroeconomic Correlation
+
+The independent Macroeconomic Correlation tab compares monthly and quarterly
+macro observations with sectoral/thematic NSE indices or a ticker such as
+`RELIANCE.NS`. Select factors, assets, analysis date, 5-20 years of history,
+same-period or subsequent returns, and optional native-period lags. Subsequent
+returns use 21 or 63 trading sessions, optionally relative to Nifty 50.
+
+No API keys are required. Automatic adapters cover MoSPI national accounts
+(including PFCE), CPI, IIP and WPI, World Bank commodities, and selected FRED
+series. Other catalogue entries require official CSV/XLSX/XLS imports; listing
+an indicator does not mean its history has been downloaded. Coverage reports
+show missing series, base years, sources, observation dates and stale history.
+Different statistical bases are not automatically spliced.
+
+Relationships include Ledoit-Wolf shrinkage, Pearson/Spearman, rolling estimates,
+block-bootstrap intervals and false-discovery adjustments. Quarterly data remain
+quarterly. A zero shrunk correlation is possible; correlation is not causation.
+Current revised downloads use explicitly exploratory release-lag proxies
+(45 days monthly, 90 days quarterly), not verified historical publication dates.
+
+Scenario analysis requires imported original release vintages, evaluates Ridge
+against independently tuned price-only and mean baselines, and purges overlapping
+labels around chronological validation/test splits. Enter transformed values
+(YoY growth %, period changes %, or rate changes in percentage points), not raw
+index levels. Estimates and residual intervals are experimental research, not
+promised returns. Imported observations must be raw levels/rates in the official
+series units, with the correct base definition and publication dates.
+
+Run/resume reuses cached downloads; full scan refreshes sources. Results and
+SQLite observations are stored under `output/latest/macro`. Download a recovery
+ZIP from Saved Data because Streamlit Cloud local storage is not permanent.
+The ZIP restores observations, price history, settings and results without keys.
+
+```powershell
+.\.venv\Scripts\python.exe run_macro.py --factors pfce_real cpi_headline brent_crude --assets "Nifty FMCG" "Nifty Bank" RELIANCE.NS --output output/latest/macro
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_macro.py
+```
+
+## Screener Customization
 
 Most screener knobs are in `screener_momentum/config.py`:
 
