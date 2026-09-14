@@ -108,6 +108,12 @@ def catalogue():
 
 
 CATALOGUE = catalogue()
+DAILY_MARKETS = {"brent_crude": "DCOILBRENTEU", "wti_crude": "DCOILWTICO",
+                 "usd_inr": "DEXINUS", "us_10y_yield": "DGS10", "us_2y_yield": "DGS2"}
+for identifier, code in DAILY_MARKETS.items():
+    old = CATALOGUE[identifier]
+    CATALOGUE[identifier] = MacroSeries(identifier, old.name, old.family,
+        "https://fred.stlouisfed.org/series/"+code, "D", old.unit, old.transform, "fred_market", code)
 COLUMNS = ["series_id", "period", "available_at", "retrieved_at", "value", "vintage", "eligible", "source", "base_year"]
 
 
@@ -280,7 +286,9 @@ class PublicMacroProvider:
             r.raise_for_status()
             f = pd.read_csv(StringIO(r.text))
             series = pd.Series(pd.to_numeric(f.iloc[:, 1], errors="coerce").to_numpy(), index=pd.to_datetime(f.iloc[:, 0]))
-            if definition.provider == "fred_daily":
+            if definition.provider == "fred_market":
+                pass
+            elif definition.provider == "fred_daily":
                 series = series.resample("ME").mean()
             else:
                 series.index = series.index.to_period("M").to_timestamp("M")
@@ -308,7 +316,7 @@ class PublicMacroProvider:
         return pd.DataFrame({"series_id": definition.identifier, "period": series.index,
             "available_at": now, "retrieved_at": now, "value": series.to_numpy(),
             "vintage": digest, "eligible": 0, "source": definition.source,
-            "base_year": json.loads(definition.code)["params"]["base_year"] if definition.provider == "mospi" else "source definition"})
+            "base_year": json.loads(definition.code)["params"]["base_year"] if definition.provider == "mospi" else "daily market" if definition.provider == "fred_market" else "source definition"})
 
     def refresh(self, identifiers, start, end, progress=None, full=False):
         health = []
@@ -319,6 +327,8 @@ class PublicMacroProvider:
             if progress:
                 progress(i, len(identifiers), d.name)
             cached = self.store.get(identifier)
+            if d.provider == "fred_market":
+                cached = cached[cached.base_year.eq("daily market")]
             try:
                 recent = not cached.empty and cached.retrieved_at.max().date() == date.today() and cached.period.min() <= pd.Timestamp(start) + pd.Timedelta(days=40)
                 matches = completed[completed.identifier == identifier]

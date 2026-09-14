@@ -226,6 +226,17 @@ Outputs are written to the `output` folder.
 
 ## Macroeconomic Correlation
 
+Market factors use daily FRED Brent/WTI spot, USD/INR and US 2Y/10Y yields,
+with weekly matching by default and optional daily sampling. Zero, one or four
+sampling-period lags compare factor changes with stock returns, without a 45-day
+publication delay. Yield changes are percentage points. Global and NSE closing
+times differ: these are retrospective associations, not same-day trading signals.
+Gold and other World Bank commodities remain monthly-average comparisons.
+The compact default excludes detailed CPI components; the full catalogue remains
+optional. Raw and shrunk correlations are visible, including zero estimates.
+Rerun older saved analyses to apply the new alignment. Old monthly market archives
+are never mixed into daily downloads.
+
 The independent Macroeconomic Correlation tab compares monthly and quarterly
 macro observations with sectoral/thematic NSE indices or a ticker such as
 `RELIANCE.NS`. Select factors, assets, analysis date, 5-20 years of history,
@@ -239,7 +250,10 @@ an indicator does not mean its history has been downloaded. Coverage reports
 show missing series, base years, sources, observation dates and stale history.
 Different statistical bases are not automatically spliced.
 
-Relationships include Ledoit-Wolf shrinkage, Pearson/Spearman, rolling estimates,
+Relationships have a selectable minimum of two or three years of matched observations
+(24/36 monthly or 8/12 quarterly). Short samples carry an instability warning;
+missing factor data are reported separately and cannot qualify by lowering the minimum.
+Estimates include Ledoit-Wolf shrinkage, Pearson/Spearman, rolling correlations,
 block-bootstrap intervals and false-discovery adjustments. Quarterly data remain
 quarterly. A zero shrunk correlation is possible; correlation is not causation.
 Current revised downloads use explicitly exploratory release-lag proxies

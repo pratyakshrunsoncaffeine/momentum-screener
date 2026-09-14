@@ -2,6 +2,7 @@ import io
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import pandas as pd
 
 from screener_momentum.macro_analysis import (
     MacroCorrelationConfig, adjust_fdr, aligned_returns, feature_history,
-    analysis_features, feature_value, scenario_model, shrunk_correlation,
+    analysis_features, analyze, market_pairs, feature_value, scenario_model, shrunk_correlation,
 )
 from screener_momentum.macro_data import CATALOGUE, MacroStore, clean_observations, parse_mospi
 
@@ -24,6 +25,43 @@ def observations(identifier="pfce_real", n=48):
 
 
 class MacroTests(unittest.TestCase):
+    def test_market_returns_no_release_delay_and_lag(self):
+        days = pd.bdate_range("2020-01-01", periods=800)
+        levels = 100*np.exp(np.cumsum(np.random.default_rng(9).normal(0, .01, len(days))))
+        obs = pd.DataFrame({"series_id": "brent_crude", "period": days,
+            "value": levels, "base_year": "daily market", "retrieved_at": pd.Timestamp("2025-01-01")})
+        prices = pd.DataFrame({"Test": levels, "Nifty 50": levels}, index=days)
+        config = MacroCorrelationConfig(market_frequency="D")
+        f = market_pairs(obs, prices, "brent_crude", "Test", config, days[-1])
+        np.testing.assert_allclose(f.x, f.y)
+        self.assertEqual(f.signal_date.iloc[0], days[1])
+        delayed = market_pairs(obs, prices, "brent_crude", "Test", MacroCorrelationConfig(market_frequency="D", market_lag=1), days[-1])
+        np.testing.assert_allclose(delayed.x, f.x.iloc[:-1])
+        self.assertTrue((delayed.signal_date < delayed.exit_date).all())
+        obs["base_year"] = "source definition"
+        self.assertTrue(market_pairs(obs, prices, "brent_crude", "Test", config, days[-1]).empty)
+
+    def test_two_and_three_year_minimums(self):
+        for identifier, n in [("pfce_real", 8), ("cpi_headline", 24)]:
+            f = pd.DataFrame({"x": np.arange(n, dtype=float), "y": np.arange(n, dtype=float),
+                "signal_date": pd.date_range("2020-01-01", periods=n), "eligible": False})
+            with patch("screener_momentum.macro_analysis.aligned_returns", return_value=f):
+                two, _ = analyze(observations(identifier), pd.DataFrame(columns=["Test"]), [identifier],
+                    MacroCorrelationConfig(bootstrap_samples=10), "2025-01-01")
+                three, _ = analyze(observations(identifier), pd.DataFrame(columns=["Test"]), [identifier],
+                    MacroCorrelationConfig(minimum_years=3, bootstrap_samples=10), "2025-01-01")
+            self.assertTrue(np.isfinite(two.Correlation.iloc[0]))
+            self.assertEqual(three.Status.iloc[0], "Insufficient History")
+            self.assertEqual(two["Sample warning"].iloc[0], "Short history; unstable estimate")
+            self.assertTrue(pd.isna(two["Long rolling correlation"].iloc[0]))
+
+    def test_missing_factor_is_not_short_history(self):
+        result, _ = analyze(observations().iloc[:0], pd.DataFrame(columns=["Test"]),
+            ["repo_rate", "cpi_headline"], MacroCorrelationConfig(), "2025-01-01")
+        statuses = result.set_index("Indicator ID").Status
+        self.assertEqual(statuses["repo_rate"], "Manual Import Required")
+        self.assertEqual(statuses["cpi_headline"], "Factor Data Unavailable")
+
     def test_mospi_fiscal_quarters(self):
         rows = [{"year": "2024-25", "quarter": q, "constant_price": v}
                 for q, v in [("Q1", 100), ("Q4", 110)]]

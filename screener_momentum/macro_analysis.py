@@ -1,7 +1,7 @@
 """Release-aware macro sensitivities and chronological scenario evaluation."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pandas as pd
@@ -23,8 +23,15 @@ class MacroCorrelationConfig:
     seed: int = 42
     relationship: str = "forward"
     lag: int = 0
+    minimum_years: int = 2
+    market_frequency: str = "W-FRI"
+    market_lag: int = 0
 
     def __post_init__(self):
+        if self.market_frequency not in ("D", "W-FRI") or self.market_lag not in (0, 1, 4):
+            raise ValueError("Invalid market sampling or lag.")
+        if self.minimum_years not in (2, 3):
+            raise ValueError("Minimum matched history must be 2 or 3 years.")
         if not 5 <= self.years <= 20 or self.horizon not in (21, 63):
             raise ValueError("Use 5-20 years and a 21- or 63-session horizon.")
         if self.relationship not in {"forward", "same_period"} or self.lag not in (0, 1, 3, 6):
@@ -73,6 +80,8 @@ def feature_history(observations, identifier, as_of, eligible_only=False, transf
             history = latest[latest.period <= row.period]
             # Explicitly exploratory: release-lag proxy is not a historical vintage.
             anchor = row.available_at.normalize() if row.eligible else row.period + pd.Timedelta(days=90 if d.frequency == "Q" else 45)
+            if d.provider == "worldbank" and not row.eligible:
+                anchor = row.period
             result.append({"signal_date": anchor, "period": row.period,
                            "x": feature_value(history, d, transform), "eligible": bool(row.eligible)})
     f = pd.DataFrame(result).dropna(subset=["x"])
@@ -80,6 +89,8 @@ def feature_history(observations, identifier, as_of, eligible_only=False, transf
 
 
 def aligned_returns(features, prices, asset, config, as_of):
+    if not features.empty and "monthly_market" in features and features.monthly_market.all():
+        config = replace(config, relationship="same_period")
     if features.empty or asset not in prices:
         return pd.DataFrame()
     columns = [asset] + (["Nifty 50"] if config.excess and asset != "Nifty 50" else [])
@@ -162,7 +173,39 @@ def analysis_features(observations, identifier, config, as_of):
         features = features.dropna(subset=["x"])
     features = features[features.signal_date >= pd.Timestamp(as_of)-pd.DateOffset(years=config.years)].copy()
     features["frequency"] = d.frequency
+    features["monthly_market"] = d.provider == "worldbank"
     return features
+
+
+def market_pairs(observations, prices, identifier, asset, config, as_of):
+    """Matched historical market changes, not same-day tradable predictions."""
+    d = CATALOGUE[identifier]
+    obs = observations[(observations.series_id == identifier) & observations.base_year.eq("daily market")]
+    obs = obs[obs.period <= pd.Timestamp(as_of)].sort_values("retrieved_at").drop_duplicates("period", keep="last")
+    if obs.empty or asset not in prices:
+        return pd.DataFrame()
+    p = prices.loc[prices.index <= pd.Timestamp(as_of)].copy()
+    if "Nifty 50" in p:
+        p = p.loc[p["Nifty 50"].notna()]
+    factor = obs.set_index("period").value.sort_index()
+    # Exact common dates: never forward-fill missing prices or mix monthly archives.
+    p["factor"] = factor.reindex(p.index)
+    if config.market_frequency == "W-FRI":
+        required = [asset, "factor"] + (["Nifty 50"] if config.excess else [])
+        p = p.dropna(subset=required).resample("W-FRI").last()
+        p = p[p.index <= pd.Timestamp(as_of)]
+    x = p.factor.diff() if d.transform == "change" else p.factor.pct_change(fill_method=None)*100
+    y = p[asset].pct_change(fill_method=None)*100
+    if config.excess:
+        if "Nifty 50" not in p:
+            return pd.DataFrame()
+        y = y-p["Nifty 50"].pct_change(fill_method=None)*100
+    f = pd.DataFrame({"x": x.shift(config.market_lag), "y": y, "eligible": False}, index=p.index)
+    f["signal_date"] = pd.Series(p.index, index=p.index).shift(config.market_lag)
+    f["entry_date"] = pd.Series(p.index, index=p.index).shift(1)
+    f["exit_date"] = p.index
+    f = f.loc[f.index >= pd.Timestamp(as_of)-pd.DateOffset(years=config.years)]
+    return f.replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
 
 
 def analyze(observations, prices, identifiers, config, as_of, progress=None, checkpoint=None):
@@ -171,32 +214,48 @@ def analyze(observations, prices, identifiers, config, as_of, progress=None, che
     total = len(identifiers) * len(assets)
     for identifier in identifiers:
         d = CATALOGUE[identifier]
-        features = analysis_features(observations, identifier, config, as_of)
+        market = d.frequency == "D"
+        features = None if market else analysis_features(observations, identifier, config, as_of)
         for asset in assets:
             if progress:
                 progress(len(rows), total, f"{asset}: {d.name}")
-            f = aligned_returns(features, prices, asset, config, as_of)
+            f = market_pairs(observations, prices, identifier, asset, config, as_of) if market else aligned_returns(features, prices, asset, config, as_of)
             pairs[(identifier, asset)] = f
             n = len(f)
-            minimum = 32 if d.frequency == "Q" else 60
+            minimum = config.minimum_years * ((52 if config.market_frequency == "W-FRI" else 252) if market else 4 if d.frequency == "Q" else 12)
+            source_present = observations.series_id.eq(identifier).any()
+            reason = f"{n} matched observations; {minimum} required."
+            status = "Insufficient History"
+            if not source_present:
+                status = "Manual Import Required" if d.provider == "import" else "Factor Data Unavailable"
+                reason = "No factor observations stored; import official data." if d.provider == "import" else "No factor observations stored; check download health."
+            elif n == 0:
+                status, reason = "No Aligned Observations", "No usable factor/price overlap with matured returns in this window."
+            elif n >= minimum and (f.x.std() <= 0 or f.y.std() <= 0):
+                status, reason = "Constant Series", "Factor or returns have no variation."
             row = {"Indicator ID": identifier, "Indicator": d.name, "Asset": asset, "Frequency": d.frequency,
-                   "Transform": d.transform, "Observations": n, "Status": "Insufficient History", "Correlation": np.nan,
-                   "Relationship": config.relationship, "Lag periods": config.lag,
+                   "Transform": d.transform, "Observations": n, "Status": status, "Correlation": np.nan,
+                   "Required observations": minimum, "Reason": reason,
+                   "Relationship": "Market changes (retrospective)" if market else "Monthly market changes (retrospective)" if d.provider == "worldbank" else config.relationship,
+                   "Lag periods": config.market_lag if market else config.lag,
+                   "Sampling": config.market_frequency if market else d.frequency,
                    "P value": np.nan, "Source": d.source, "History": "Exploratory: revised values / estimated release dates"}
             if n >= minimum and f.x.std() > 0 and f.y.std() > 0:
                 x, y = f.x.to_numpy(), f.y.to_numpy()
                 rho = shrunk_correlation(x, y)
                 lo, hi, pv = bootstrap_stats(x, y, config.bootstrap_samples, config.seed, 4 if d.frequency == "Q" else 6)
-                window1, window2 = (12, 20) if d.frequency == "Q" else (36, 60)
+                window1, window2 = ((52, 156) if config.market_frequency == "W-FRI" else (252, 756)) if market else (12, 20) if d.frequency == "Q" else (36, 60)
                 rolling = [shrunk_correlation(x[i-window1:i], y[i-window1:i]) for i in range(window1, n+1)]
                 row.update({"Correlation": rho, "Pearson": np.corrcoef(x, y)[0, 1], "Spearman": spearmanr(x, y).statistic,
                             "Untrimmed": shrunk_correlation(x, y, False), "CI low": lo, "CI high": hi, "P value": pv,
-                            "Recent correlation": shrunk_correlation(x[-window1:], y[-window1:]),
-                            "Long rolling correlation": shrunk_correlation(x[-window2:], y[-window2:]),
-                            "Sign stability %": np.mean(np.sign(rolling) == np.sign(rho))*100,
+                            "Recent correlation": shrunk_correlation(x[-window1:], y[-window1:]) if n >= window1 else np.nan,
+                            "Long rolling correlation": shrunk_correlation(x[-window2:], y[-window2:]) if n >= window2 else np.nan,
+                            "Sign stability %": np.mean(np.sign(rolling) == np.sign(rho))*100 if rolling else np.nan,
                             "First signal": f.signal_date.min(), "Last signal": f.signal_date.max(),
                             "Status": "Exploratory" if not f.eligible.all() else "Estimated",
-                            "History": "Release vintages" if f.eligible.all() else row["History"]})
+                            "History": "Release vintages" if f.eligible.all() else row["History"],
+                            "Sample warning": "Short history; unstable estimate" if n < (32 if d.frequency == "Q" else 60) else "",
+                            "Reason": "Estimated correlation shrunk to zero." if rho == 0 else "Correlation calculated."})
             rows.append(row)
             if checkpoint:
                 checkpoint(pd.DataFrame(rows))
@@ -233,6 +292,8 @@ def tune_ridge(development, columns):
 def scenario_model(observations, prices, identifiers, asset, values, config, as_of):
     if not 1 <= len(identifiers) <= 5:
         raise ValueError("Choose one to five factors.")
+    if any(CATALOGUE[i].frequency == "D" for i in identifiers):
+        raise ValueError("Daily market factors are retrospective sensitivities, not release-vintage scenario inputs.")
     frequencies = {CATALOGUE[i].frequency for i in identifiers}
     if config.relationship != "forward" or config.lag:
         raise ValueError("Scenarios require forward returns and zero additional lag.")
