@@ -1668,7 +1668,8 @@ with tabs[9]:
 with tabs[10]:
     st.subheader("Quality Momentum")
     st.caption(
-        "Price-first trendline momentum for the supplied Nifty MidSmallcap 400 universe. "
+        "Price-first trendline momentum for the largest 2,000 companies with available market caps "
+        "from the supplied NSE ticker list. Market-cap source and snapshot date are included in the scan data. "
         "Only the top price-qualified decile proceeds to Screener.in ownership, pledge, business-quality, and NSE surveillance checks."
     )
     quality_upload = st.file_uploader(
@@ -1678,6 +1679,15 @@ with tabs[10]:
         help="Upload a Ticker, Ticker Name, Symbol, NSE Symbol, or single-column ticker file.",
     )
     quality_csv_path = str(QUALITY_MOMENTUM_TICKER_FILE)
+    if quality_upload is None:
+        bundled_quality = read_csv_if_exists(QUALITY_MOMENTUM_TICKER_FILE)
+        if "Market Cap As Of" in bundled_quality:
+            oldest_cap_date = pd.to_datetime(bundled_quality["Market Cap As Of"], errors="coerce").min()
+            if pd.notna(oldest_cap_date) and (pd.Timestamp.today().normalize() - oldest_cap_date).days > 30:
+                st.warning(
+                    f"Some bundled market-cap rankings use a saved snapshot from {oldest_cap_date.date()}. "
+                    "Companies without a usable market cap are excluded; ranks near the 2,000th cutoff may have changed."
+                )
     if quality_upload is not None:
         quality_temp = NamedTemporaryFile(delete=False, suffix=".csv")
         quality_temp.write(quality_upload.getbuffer())
@@ -1781,12 +1791,21 @@ with tabs[10]:
     if quality_metrics.empty:
         default_count = len(read_csv_if_exists(QUALITY_MOMENTUM_TICKER_FILE))
         st.info(
-            f"Ready to scan the supplied {default_count:,}-stock Nifty MidSmallcap universe. "
+            f"Ready to scan the supplied {default_count:,}-stock market-cap-ranked universe. "
             "A replacement ticker CSV can be uploaded above."
         )
     else:
         if quality_stale:
             st.warning("Showing a saved Quality Momentum run. Check Data Health for its source dates.")
+        if not quality_verified.empty and "Promoter Pledge %" in quality_verified:
+            missing_pledge = int(quality_verified["Promoter Pledge %"].isna().sum())
+            if missing_pledge:
+                st.warning(
+                    f"Promoter pledge could not be verified for {missing_pledge:,} shortlisted companies. "
+                    "They remain pending rather than being treated as unpledged; see Live Verification."
+                )
+        if quality_verified.empty and not quality_shortlist.empty:
+            st.info("Price shortlist is saved. Fundamental verification has not finished yet; Run / Resume to continue.")
         quality_pending = (
             int(quality_verified.get("Quality Status", pd.Series(dtype=str)).eq("Pending verification").sum())
             if not quality_verified.empty else 0

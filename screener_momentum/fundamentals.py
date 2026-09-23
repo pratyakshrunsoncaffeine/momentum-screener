@@ -392,12 +392,12 @@ def fetch_company_fundamentals(
 def fetch_company_quality_metrics(
     symbol: str,
     session: requests.Session | None = None,
-    timeout: int = 20,
+    timeout: int = 10,
 ) -> dict[str, Any]:
     """Fetch all quality-momentum fundamentals from one Screener company page."""
     session = session or requests.Session()
     session.headers.update(HEADERS)
-    url, html = fetch_screener_html(symbol, session=session, timeout=timeout)
+    url, html = fetch_screener_html(symbol, session=session, timeout=timeout, max_attempts=2)
     soup = BeautifulSoup(html, "lxml")
     fii = extract_fii_holding_change(soup)
     dii = extract_dii_holding_change(soup)
@@ -552,7 +552,12 @@ def passes_fundamental_filters(
         ),
         (
             "Promoter Holding Change %",
-            abs(metrics.get("Promoter Holding Change %") or 9999),
+            (
+                abs(metrics["Promoter Holding Change %"])
+                if metrics.get("Promoter Holding Change %") is not None
+                and not pd.isna(metrics["Promoter Holding Change %"])
+                else None
+            ),
             values["max_promoter_holding_change_pct"],
             "<=",
             "promoter holding change",

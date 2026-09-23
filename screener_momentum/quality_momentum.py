@@ -300,14 +300,14 @@ class NseQualityReferenceProvider:
         return master, surveillance, pd.DataFrame([master_health, surveillance_health])
 
     def fetch_security_master(self, as_of: date) -> tuple[pd.DataFrame, dict[str, Any]]:
-        for offset in range(10):
+        for offset in range(5):
             report_date = as_of - timedelta(days=offset)
             url = (
                 "https://nsearchives.nseindia.com/content/cm/"
                 f"NSE_CM_security_{report_date.strftime('%d%m%Y')}.csv.gz"
             )
             try:
-                response = self.session.get(url, timeout=30)
+                response = self.session.get(url, timeout=8)
                 response.raise_for_status()
                 frame = pd.read_csv(BytesIO(gzip.decompress(response.content)), low_memory=False)
                 parsed = parse_security_master(frame)
@@ -325,7 +325,7 @@ class NseQualityReferenceProvider:
 
         url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
         try:
-            response = self.session.get(url, timeout=30)
+            response = self.session.get(url, timeout=8)
             response.raise_for_status()
             parsed = parse_security_master(pd.read_csv(BytesIO(response.content)))
             return parsed, _health("NSE security master", "static fallback", as_of, url, len(parsed))
@@ -333,7 +333,7 @@ class NseQualityReferenceProvider:
             return pd.DataFrame(), _health("NSE security master", "failed", as_of, url, 0, str(exc))
 
     def fetch_surveillance(self, as_of: date) -> tuple[pd.DataFrame, dict[str, Any]]:
-        for offset in range(10):
+        for offset in range(5):
             report_date = as_of - timedelta(days=offset)
             for prefix in ("REG1_IND", "REG_IND"):
                 filename = f"{prefix}{report_date.strftime('%d%m%y')}.csv"
@@ -343,7 +343,7 @@ class NseQualityReferenceProvider:
                 ):
                     url = f"{base_url}{filename}"
                     try:
-                        response = self.session.get(url, timeout=30)
+                        response = self.session.get(url, timeout=8)
                         response.raise_for_status()
                         if response.content.lstrip().startswith(b"<"):
                             continue
@@ -463,6 +463,14 @@ def screen_quality_fundamentals(
             saved = pd.read_csv(checkpoint)
             saved["Ticker"] = saved["Ticker"].astype(str).str.upper()
             saved = saved[saved["Ticker"].isin(candidate_by_ticker)].drop_duplicates("Ticker", keep="last")
+            if "Screener Fetch Error" in saved:
+                saved = saved[saved["Screener Fetch Error"].isna() | saved["Screener Fetch Error"].eq("")]
+            if "Governance Fetched Date" in saved:
+                fetched = pd.to_datetime(saved["Governance Fetched Date"], errors="coerce")
+                age_days = (pd.Timestamp(scan_date) - fetched).dt.days
+                saved = saved[age_days.between(0, config.max_quote_age_days)]
+            else:
+                saved = saved.iloc[0:0]
             rows = [
                 {**saved_row, **candidate_by_ticker[str(saved_row["Ticker"]).upper()]}
                 for saved_row in saved.to_dict("records")
@@ -642,7 +650,7 @@ def verify_latest_trend(
         else:
             price = float(series.iloc[-1])
             price_date = pd.Timestamp(series.index[-1])
-            source = "Yahoo Finance refresh"
+            source = "Yahoo Finance completed close"
             sma50 = float(series.tail(config.sma_fast_days).mean()) if len(series) >= config.sma_fast_days else _number(item.get("SMA50"))
             sma200 = float(series.tail(config.sma_slow_days).mean()) if len(series) >= config.sma_slow_days else _number(item.get("SMA200"))
         age = (today - price_date.date()).days if pd.notna(price_date) else None
@@ -679,9 +687,12 @@ def build_quality_rejections(price_metrics: pd.DataFrame, verified: pd.DataFrame
     price_rejected = price_metrics.loc[~price_metrics["Price Stage Pass"].fillna(False)].copy()
     price_rejected["Rejection Stage"] = "Price and momentum"
     price_rejected["Rejection Reasons"] = price_rejected["Price Rejection Reasons"]
-    quality_rejected = verified.loc[~verified["Final Pass"].fillna(False)].copy()
+    quality_rejected = (
+        verified.loc[~verified["Final Pass"].fillna(False)].copy()
+        if "Final Pass" in verified else verified.copy()
+    )
     quality_rejected["Rejection Stage"] = "Live verification"
-    quality_rejected["Rejection Reasons"] = quality_rejected["Quality Rejection Reasons"]
+    quality_rejected["Rejection Reasons"] = quality_rejected.get("Quality Rejection Reasons", "")
     columns = list(dict.fromkeys([*price_metrics.columns, *verified.columns, "Rejection Stage", "Rejection Reasons"]))
     return pd.concat(
         [price_rejected.reindex(columns=columns), quality_rejected.reindex(columns=columns)],

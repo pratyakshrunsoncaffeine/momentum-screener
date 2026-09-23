@@ -1,23 +1,78 @@
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 
 from screener_momentum.config import QualityMomentumConfig
+from screener_momentum.pipeline import load_saved_quality_momentum, run_quality_momentum_screen
 from screener_momentum.quality_momentum import (
+    build_quality_rejections,
     calculate_quality_price_metrics,
     evaluate_quality_fundamentals,
     parse_security_master,
     parse_surveillance_report,
+    screen_quality_fundamentals,
     trendline_momentum,
     verify_latest_trend,
 )
 
 
 class QualityMomentumTests(unittest.TestCase):
+    def test_stale_quality_checkpoint_is_fetched_again(self) -> None:
+        shortlist = pd.DataFrame({"Ticker": ["ABC"], "YFinance Ticker": ["ABC.NS"]})
+        with TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "partial.csv"
+            pd.DataFrame({
+                "Ticker": ["ABC"],
+                "Governance Fetched Date": ["2026-01-01"],
+                "Promoter Pledge %": [0.0],
+                "Screener Fetch Error": [""],
+            }).to_csv(checkpoint, index=False)
+            with patch("screener_momentum.quality_momentum.fetch_company_quality_metrics", return_value={"Promoter Pledge %": 5.0}) as fetch, \
+                 patch("screener_momentum.quality_momentum.time.sleep"):
+                result = screen_quality_fundamentals(
+                    shortlist, pd.DataFrame(), pd.DataFrame(), QualityMomentumConfig(),
+                    checkpoint_path=checkpoint, as_of=date(2026, 9, 23),
+                )
+            fetch.assert_called_once()
+            self.assertEqual(result.iloc[0]["Promoter Pledge %"], 5.0)
+
+    def test_no_price_matches_completes_and_recovers(self) -> None:
+        dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=320)
+        closes = pd.DataFrame({"FLAT.NS": [100.0] * 320}, index=dates)
+        volumes = pd.DataFrame({"FLAT.NS": [200_000.0] * 320}, index=dates)
+        universe = pd.DataFrame({"Ticker": ["FLAT"], "YFinance Ticker": ["FLAT.NS"]})
+        with TemporaryDirectory() as temporary:
+            with patch("screener_momentum.pipeline.load_ticker_universe", return_value=universe), \
+                 patch("screener_momentum.pipeline.download_quality_history", return_value=(closes, volumes)), \
+                 patch("screener_momentum.pipeline.NseQualityReferenceProvider") as provider:
+                provider.return_value.fetch.return_value = (
+                    pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+                )
+                result = run_quality_momentum_screen(
+                    "unused.csv", QualityMomentumConfig(), output_dir=Path(temporary), resume=False
+                )
+            saved = load_saved_quality_momentum(Path(temporary))
+            self.assertTrue(result["final"].empty)
+            self.assertEqual(result["rejected"]["Ticker"].tolist(), ["FLAT"])
+            self.assertEqual(saved["metrics"]["Ticker"].tolist(), ["FLAT"])
+
+    def test_empty_shortlist_still_produces_price_rejections(self) -> None:
+        prices = pd.DataFrame({
+            "Ticker": ["ABC"],
+            "Price Stage Pass": [False],
+            "Price Rejection Reasons": ["below SMA200"],
+        })
+        rejected = build_quality_rejections(prices, pd.DataFrame())
+        self.assertEqual(rejected["Ticker"].tolist(), ["ABC"])
+        self.assertEqual(rejected["Rejection Reasons"].tolist(), ["below SMA200"])
+
     def test_trendline_score_rewards_a_consistent_uptrend(self) -> None:
         smooth = pd.Series(100.0 * np.exp(np.arange(126) * 0.002))
         score, annualized, r_squared = trendline_momentum(smooth, 126)

@@ -189,7 +189,7 @@ Saved 200DMA files:
 
 ## Quality Momentum
 
-The `Quality Momentum` tab runs a staged trend-quality screen on the bundled Nifty MidSmallcap 400 universe or on a ticker-only CSV uploaded in the dashboard.
+The `Quality Momentum` tab runs a staged trend-quality screen on the bundled top 2,000 market-cap-ranked companies from `ticker.csv`, or on a ticker-only CSV uploaded in the dashboard. The bundled file includes each market cap's source and snapshot date. It was built from the saved Screener.in FII scan, with missing caps filled from Yahoo Finance; tickers still lacking a cap were excluded rather than ranked as zero. Market caps change, so rerun the FII scan and then `python refresh_quality_universe.py` to refresh this universe locally before committing a new snapshot.
 
 1. Yahoo Finance prices and volumes are used to calculate average daily traded value, RSI, 50-day and 200-day averages, price extension, 52-week-high distance, and 21-day return.
 2. Trendline momentum is the annualized slope of log prices multiplied by the regression R-squared, rewarding both trend strength and consistency.

@@ -1103,18 +1103,22 @@ def run_quality_momentum_screen(
         checkpoint_path=paths["quality_momentum_fundamentals_partial"],
         resume=resume and not restart,
     )
-    latest_closes, _ = download_quality_history(
-        shortlist["YFinance Ticker"].astype(str).tolist(),
-        batch_size=10,
-        period="1y",
-        progress_callback=price_progress_callback,
-    ) if not shortlist.empty else (pd.DataFrame(), pd.DataFrame())
-    verified = verify_latest_trend(verified_fundamentals, latest_closes, config)
-    final = verified.loc[verified["Final Pass"].fillna(False)].copy()
+    # Reuse the same completed daily closes used for selection. A second full
+    # download of the shortlist adds latency and can leave an otherwise finished
+    # scan blank when Yahoo temporarily fails.
+    verified = verify_latest_trend(verified_fundamentals, closes, config)
+    final = (
+        verified.loc[verified["Final Pass"].fillna(False)].copy()
+        if "Final Pass" in verified else verified.copy()
+    )
     rejected = build_quality_rejections(metrics, verified)
 
     price_available = int(closes.notna().any().sum()) if not closes.empty else 0
     price_date = closes.index.max().date().isoformat() if not closes.empty else ""
+    pledge_covered = (
+        int(verified_fundamentals["Promoter Pledge %"].notna().sum())
+        if "Promoter Pledge %" in verified_fundamentals else 0
+    )
     health = pd.concat(
         [
             pd.DataFrame(
@@ -1140,6 +1144,15 @@ def run_quality_momentum_screen(
                         "Stocks Requested": len(shortlist),
                         "Stocks Available": len(verified_fundamentals),
                         "Message": "Checkpointed after every company.",
+                    },
+                    {
+                        "Source": "Screener.in promoter pledge",
+                        "Status": "complete" if pledge_covered == len(shortlist) else "incomplete",
+                        "Data Date": date.today().isoformat(),
+                        "Rows": pledge_covered,
+                        "Stocks Requested": len(shortlist),
+                        "Stocks Available": pledge_covered,
+                        "Message": "Missing pledge values remain pending, never assumed to be zero.",
                     },
                 ]
             ),
@@ -1169,10 +1182,13 @@ def load_saved_quality_momentum(
     metrics = _read_saved_frame(paths["quality_momentum_metrics"])
     if metrics.empty:
         raise FileNotFoundError("No saved Quality Momentum scan is available yet.")
+    verified = _read_saved_frame(paths["quality_momentum_verified"])
+    if verified.empty:
+        verified = _read_saved_frame(paths["quality_momentum_fundamentals_partial"])
     return {
         "metrics": metrics,
         "shortlist": _read_saved_frame(paths["quality_momentum_shortlist"]),
-        "verified": _read_saved_frame(paths["quality_momentum_verified"]),
+        "verified": verified,
         "final": _read_saved_frame(paths["quality_momentum_final"]),
         "rejected": _read_saved_frame(paths["quality_momentum_rejected"]),
         "health": _read_saved_frame(paths["quality_momentum_health"]),
