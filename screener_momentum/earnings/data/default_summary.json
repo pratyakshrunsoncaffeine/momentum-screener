@@ -1,0 +1,25 @@
+{
+  "input_count": 2926,
+  "unique_input_tickers": 2926,
+  "scored_count": 2139,
+  "unscored_count": 787,
+  "target_period_end": "2026-09-30",
+  "as_of_ist": "2026-10-02T00:00:00+05:30",
+  "previous_period_end": "2026-06-30",
+  "model_kind": "two_hidden_layer_relu_mlp_numpy",
+  "model_training_n": 36281,
+  "model_calibration_n": 5373,
+  "model_calibration_cutoff_ist": "2026-09-30 23:59:59+05:30",
+  "archive_file": "screener_momentum/earnings/data/caelion_model_panel.zip",
+  "archive_info": {
+    "panel_rows": 61372,
+    "eligible_rows": 55301,
+    "latest_archived_knowledge_utc": "2026-09-29 14:54:16+00:00"
+  },
+  "status_counts": {
+    "Scored": 2139,
+    "No eligible filing under this ticker by the as-of time": 673,
+    "Latest eligible quarter is not 2026-06-30": 92,
+    "Latest filing has an accounting-basis switch": 22
+  }
+}

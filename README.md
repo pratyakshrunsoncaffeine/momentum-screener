@@ -11,6 +11,8 @@ The dashboard also backtests a portfolio invested in the top 10 final companies:
 
 It also includes independent FII, DII, quarterly-results, post-earnings stock-return, NSE index momentum, uploaded-stock momentum, macro correlation, Quality Momentum, and 200DMA opportunity workflows. Each long-running scanner writes checkpoints so a Streamlit refresh does not discard completed work.
 
+The **Earnings Probability** tab ranks all 2,926 supplied NSE tickers by a calibrated model's estimated chance that first-reported quarterly net profit exceeds the preceding quarter. It opens on a saved 30 September 2026 season snapshot (information cutoff 2 October 2026, 00:00 IST) and shows an explicit reason for every unscored ticker. Choose another quarter and cutoff, then click **Run earnings model** to score the full bundled first-filing panel again. The archive's latest filing timestamp is shown in the tab; it does not fetch new exchange filings automatically. The **Top 50 + market cap** subtab selects by earnings probability first, then filters and sorts those names by a dated market-cap snapshot from linked Screener profiles. Market cap and industry are display filters, not model inputs. The tab offers CSV downloads for the ranking and full coverage.
+
 The portfolio tab uses a monthly walk-forward price backtest. Each month it recalculates momentum using only price data available before that rebalance date, invests for one month, then reinvests the ending capital into the next month's selected portfolio. If fundamentals are applied, the historical backtest uses the current fundamentals-passed universe as a static filter, so it avoids price lookahead but still has current-fundamentals bias.
 
 ## Dashboard Flow

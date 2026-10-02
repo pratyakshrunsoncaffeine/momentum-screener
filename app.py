@@ -65,6 +65,7 @@ from screener_momentum.pipeline import (
 )
 from screener_momentum.sma200 import sma200_chart_data
 from screener_momentum.macro_dashboard import render_macro_dashboard
+from screener_momentum.earnings.view import render_earnings_dashboard
 
 
 ROOT = Path(__file__).resolve().parent
@@ -513,6 +514,7 @@ tabs = st.tabs(
         "Quality Momentum",
         "200DMA Finder",
         "Macroeconomic Correlation",
+        "Earnings Probability",
     ]
 )
 
@@ -2121,3 +2123,6 @@ with tabs[11]:
 
 with tabs[12]:
     render_macro_dashboard(OUTPUT_DIR)
+
+with tabs[13]:
+    render_earnings_dashboard()
