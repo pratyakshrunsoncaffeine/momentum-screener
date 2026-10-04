@@ -11,3 +11,5 @@ output*/
 .streamlit/secrets.toml
 .env
 upload_github/
+graphify-out/
+work/

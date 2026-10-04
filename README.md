@@ -1,5 +1,7 @@
 # Momentum Screener
 
+The **Evening Swing Screener** dashboard tab scans the full ticker list for long-only 5–10-session setups using price structure, daily/weekly trend, momentum, volume, relative strength and shortlist VWAP confirmation. It exports entry triggers, maximum fills, structural stops, targets, industry coverage and a persistent watchlist. Run manually at 8 p.m. IST with `.venv\Scripts\python.exe run_swing.py` or `./start_swing_scan.ps1`. See [the indicator selection, exact rules and research sources](docs/swing_rules.md). Scores are setup rankings, not calibrated probabilities.
+
 This project screens NSE stocks from `ticker.csv` in four stages:
 
 1. Append `.NS` to every ticker and fetch prices with `yfinance`.
