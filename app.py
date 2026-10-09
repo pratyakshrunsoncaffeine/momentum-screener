@@ -38,6 +38,7 @@ from screener_momentum.pipeline import (
     load_saved_sma200_results,
     load_saved_index_momentum,
     load_saved_custom_stock_momentum,
+    load_saved_strategy_screener,
     load_saved_quality_momentum,
     load_saved_returns,
     output_paths,
@@ -54,6 +55,7 @@ from screener_momentum.pipeline import (
     rescore_saved_index_momentum,
     reset_index_momentum_scan,
     run_custom_stock_momentum,
+    run_strategy_screener,
     run_quality_momentum_screen,
     run_sma200_screen,
     run_momentum,
@@ -517,6 +519,7 @@ tabs = st.tabs(
         "Macroeconomic Correlation",
         "Earnings Probability",
         "Evening Swing Screener",
+        "Strategy Screeners",
     ]
 )
 
@@ -2131,3 +2134,159 @@ with tabs[13]:
 
 with tabs[14]:
     render_swing_dashboard(csv_path, ROOT / "output" / "swing" / "latest")
+
+with tabs[15]:
+    st.subheader("Daily-Candle Strategy Screeners")
+    st.caption(
+        "Independent, read-only Yahoo Finance scans from the uploaded/default NSE ticker universe. "
+        "No Dhan credentials, broker connections, or order execution are used."
+    )
+    strategy_tabs = st.tabs(["Test Insta Strategy", "M Mom D Draw"])
+    strategy_definitions = {
+        "Test Insta Strategy": (
+            "Close above EMA50 and EMA200; 30-session average volume above 200,000; "
+            "63-session return strictly above 30%; 20-session ADR at least 4%; "
+            "at least 201 daily OHLCV rows. Qualified rows rank by 3-month return.",
+            "test_insta_strategy_results",
+        ),
+        "M Mom D Draw": (
+            "63-session return at least 10%; 21-session return positive; volume at least 200,000; "
+            "close above EMA20/50/200; a 2%-10% five-session pullback with at least two down sessions; "
+            "no more than 12% below the 60-session high. Score = 70% 3-month + 30% 1-month return.",
+            "m_mom_d_draw_results",
+        ),
+    }
+    for strategy_index, strategy in enumerate(strategy_definitions):
+        with strategy_tabs[strategy_index]:
+            description, session_key = strategy_definitions[strategy]
+            st.caption(description)
+            with st.expander("Strategy rules and calculation conventions"):
+                st.markdown(
+                    "- Prices use Yahoo Finance adjusted daily OHLC; volume is shares traded.\n"
+                    "- 1 month = 21 sessions, 3 months = 63 sessions, and five-session return compares the latest close with the close six rows back.\n"
+                    "- ADR = mean of `(High - Low) / Close × 100` over 20 sessions.\n"
+                    "- EMA uses the standard exponentially weighted close with `adjust=False`.\n"
+                    "- Every row, including failures and insufficient-history symbols, remains available with its rejection reason."
+                )
+            controls = st.columns(4)
+            min_history = controls[0].number_input(
+                "Minimum daily rows", min_value=201, max_value=750, value=201, step=5,
+                key=f"{session_key}_history",
+            )
+            minimum_volume = controls[1].number_input(
+                "Minimum average volume", min_value=0, max_value=10_000_000, value=200_000,
+                step=25_000, key=f"{session_key}_volume",
+            )
+            batch_size = controls[2].slider(
+                "Yahoo batch size", min_value=10, max_value=100, value=50, step=10,
+                key=f"{session_key}_batch",
+            )
+            if strategy == "Test Insta Strategy":
+                min_return_3m = controls[3].number_input(
+                    "Minimum 3M return (%)", min_value=0.0, max_value=200.0, value=30.0,
+                    step=1.0, key=f"{session_key}_return",
+                )
+                extra = st.columns(2)
+                min_adr = extra[0].number_input(
+                    "Minimum 20D ADR (%)", min_value=0.0, max_value=30.0, value=4.0,
+                    step=0.5, key=f"{session_key}_adr",
+                )
+                max_below_high = 12.0
+                min_dip, max_dip = 2.0, 10.0
+            else:
+                min_return_3m = controls[3].number_input(
+                    "Minimum 3M return (%)", min_value=0.0, max_value=200.0, value=10.0,
+                    step=1.0, key=f"{session_key}_return",
+                )
+                extra = st.columns(3)
+                min_dip = extra[0].number_input(
+                    "Minimum 5D dip (%)", min_value=0.0, max_value=30.0, value=2.0,
+                    step=0.5, key=f"{session_key}_min_dip",
+                )
+                max_dip = extra[1].number_input(
+                    "Maximum 5D dip (%)", min_value=float(min_dip), max_value=50.0, value=max(10.0, float(min_dip)),
+                    step=0.5, key=f"{session_key}_max_dip",
+                )
+                max_below_high = extra[2].number_input(
+                    "Maximum below 60D high (%)", min_value=0.0, max_value=50.0, value=12.0,
+                    step=1.0, key=f"{session_key}_high_distance",
+                )
+                min_adr = 4.0
+
+            actions = st.columns(3)
+            run_strategy = actions[0].button(
+                "Run / Resume", type="primary", use_container_width=True,
+                key=f"{session_key}_run",
+            )
+            restart_strategy = actions[1].button(
+                "Run Full Scan From Beginning", use_container_width=True,
+                key=f"{session_key}_restart",
+            )
+            load_strategy = actions[2].button(
+                "Use Saved Results", use_container_width=True,
+                key=f"{session_key}_saved",
+            )
+
+            if run_strategy or restart_strategy:
+                progress = make_progress(f"{strategy}: downloading and evaluating daily prices")
+                try:
+                    st.session_state[session_key] = run_strategy_screener(
+                        ticker_csv=csv_path,
+                        strategy=strategy,
+                        progress_callback=progress,
+                        output_dir=OUTPUT_DIR,
+                        batch_size=int(batch_size),
+                        resume=not restart_strategy,
+                        min_history=int(min_history),
+                        min_average_volume=int(minimum_volume),
+                        insta_min_return_3m=float(min_return_3m),
+                        insta_min_adr_20d=float(min_adr),
+                        draw_min_return_3m=float(min_return_3m),
+                        draw_min_dip_5d=float(min_dip),
+                        draw_max_dip_5d=float(max_dip),
+                        draw_max_below_60d_high=float(max_below_high),
+                        restart=restart_strategy,
+                    )
+                    st.success(f"{strategy} finished; price histories and results were checkpointed.")
+                except Exception as exc:
+                    st.error(f"{strategy} stopped: {exc}")
+
+            if load_strategy:
+                try:
+                    st.session_state[session_key] = load_saved_strategy_screener(strategy, OUTPUT_DIR)
+                    st.success(f"Loaded the saved {strategy} run.")
+                except FileNotFoundError as exc:
+                    st.error(str(exc))
+
+            saved = st.session_state.get(session_key, {})
+            results = saved.get("results", pd.DataFrame()).copy()
+            health = saved.get("health", pd.DataFrame()).copy()
+            if results.empty:
+                st.info("Run the scan or load a previously saved result.")
+                continue
+            if saved.get("stale"):
+                st.warning("Showing saved results; use Run / Resume to refresh missing ticker histories and recalculate.")
+            qualified = results.loc[results["Status"].eq("Qualified")].copy()
+            rejected = results.loc[~results["Status"].eq("Qualified")].copy()
+            stats = st.columns(4)
+            stats[0].metric("Universe", f"{len(results):,}")
+            stats[1].metric("Qualified", f"{len(qualified):,}")
+            stats[2].metric("Rejected", f"{len(rejected):,}")
+            latest_price_date = pd.to_datetime(results["Price Date"], errors="coerce").max()
+            stats[3].metric(
+                "Latest price date",
+                latest_price_date.date().isoformat() if pd.notna(latest_price_date) else "NA",
+            )
+            result_views = st.tabs(["Qualified Opportunities", "All Rejections", "Data Health"])
+            with result_views[0]:
+                if qualified.empty:
+                    st.info("No companies currently satisfy every configured rule.")
+                else:
+                    st.dataframe(format_percent_columns(qualified), use_container_width=True, hide_index=True)
+                    show_download(f"Download {strategy} qualified companies", qualified, f"{session_key}.csv")
+            with result_views[1]:
+                st.dataframe(format_percent_columns(rejected), use_container_width=True, hide_index=True)
+                show_download(f"Download {strategy} rejections", rejected, f"{session_key}_rejected.csv")
+            with result_views[2]:
+                st.dataframe(health, use_container_width=True, hide_index=True)
+                show_download(f"Download {strategy} data health", health, f"{session_key}_health.csv")

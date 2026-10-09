@@ -57,6 +57,7 @@ from .sma200 import (
     preliminary_quote_tickers,
     walk_forward_sma200_backtest,
 )
+from .strategy_screeners import download_strategy_history, evaluate_strategy
 from .universe import load_ticker_universe
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -145,6 +146,11 @@ def output_paths(output_dir: str | Path = "output/latest") -> dict[str, Path]:
         "quality_momentum_final": root / "quality_momentum_final.csv",
         "quality_momentum_rejected": root / "quality_momentum_rejected.csv",
         "quality_momentum_health": root / "quality_momentum_health.csv",
+        "strategy_screeners_cache": root.parent / "strategy_screeners_cache",
+        "test_insta_results": root / "test_insta_strategy.csv",
+        "test_insta_health": root / "test_insta_strategy_health.csv",
+        "m_mom_d_draw_results": root / "m_mom_d_draw_strategy.csv",
+        "m_mom_d_draw_health": root / "m_mom_d_draw_strategy_health.csv",
     }
 
 
@@ -657,6 +663,82 @@ def load_saved_custom_stock_momentum(output_dir: str | Path = "output/latest") -
         "ranking": ranking,
         "health": _read_saved_frame(paths["custom_stock_health"]),
     }
+
+
+def run_strategy_screener(
+    ticker_csv: str | Path,
+    strategy: str,
+    progress_callback: ProgressCallback | None = None,
+    output_dir: str | Path = "output/latest",
+    batch_size: int = 50,
+    resume: bool = True,
+    min_history: int = 201,
+    min_average_volume: int = 200_000,
+    insta_min_return_3m: float = 30.0,
+    insta_min_adr_20d: float = 4.0,
+    draw_min_return_3m: float = 10.0,
+    draw_min_dip_5d: float = 2.0,
+    draw_max_dip_5d: float = 10.0,
+    draw_max_below_60d_high: float = 12.0,
+    restart: bool = False,
+) -> dict[str, pd.DataFrame]:
+    """Run one read-only daily-candle strategy with per-ticker Yahoo checkpoints."""
+    paths = output_paths(output_dir)
+    strategy_is_insta = strategy.casefold() == "test insta strategy"
+    result_key = "test_insta_results" if strategy_is_insta else "m_mom_d_draw_results"
+    health_key = "test_insta_health" if strategy_is_insta else "m_mom_d_draw_health"
+    if restart:
+        paths[result_key].unlink(missing_ok=True)
+        cache = paths["strategy_screeners_cache"]
+        if cache.exists():
+            for cached_price_file in cache.glob("*.csv"):
+                cached_price_file.unlink(missing_ok=True)
+    universe = load_ticker_universe(ticker_csv)
+    history_status = download_strategy_history(
+        universe["YFinance Ticker"].astype(str).tolist(),
+        cache_dir=paths["strategy_screeners_cache"],
+        batch_size=batch_size,
+        progress_callback=progress_callback,
+        resume=resume and not restart,
+    )
+    results = evaluate_strategy(
+        universe,
+        cache_dir=paths["strategy_screeners_cache"],
+        strategy=strategy,
+        min_history=min_history,
+        min_average_volume=min_average_volume,
+        insta_min_return_3m=insta_min_return_3m,
+        insta_min_adr_20d=insta_min_adr_20d,
+        draw_min_return_3m=draw_min_return_3m,
+        draw_min_dip_5d=draw_min_dip_5d,
+        draw_max_dip_5d=draw_max_dip_5d,
+        draw_max_below_60d_high=draw_max_below_60d_high,
+    )
+    save_frame(results, paths[result_key])
+    health = history_status.merge(
+        results[["YFinance Ticker", "Price Date", "Price Observations", "Status"]],
+        on="YFinance Ticker",
+        how="left",
+    )
+    health["Scan Strategy"] = strategy
+    health["Saved At UTC"] = pd.Timestamp.now(tz="UTC").isoformat()
+    save_frame(health, paths[health_key])
+    return {"universe": universe, "results": results, "health": health, "stale": False}
+
+
+def load_saved_strategy_screener(
+    strategy: str,
+    output_dir: str | Path = "output/latest",
+) -> dict[str, pd.DataFrame]:
+    paths = output_paths(output_dir)
+    strategy_is_insta = strategy.casefold() == "test insta strategy"
+    key = "test_insta_results" if strategy_is_insta else "m_mom_d_draw_results"
+    health_key = "test_insta_health" if strategy_is_insta else "m_mom_d_draw_health"
+    results = _read_saved_frame(paths[key])
+    if results.empty:
+        raise FileNotFoundError(f"No saved {strategy} run is available yet.")
+    health = _read_saved_frame(paths[health_key])
+    return {"results": results, "health": health, "stale": True}
 
 
 def _index_momentum_metadata(
